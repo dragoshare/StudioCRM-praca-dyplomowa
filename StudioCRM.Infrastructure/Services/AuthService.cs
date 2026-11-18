@@ -1,0 +1,874 @@
+using System.IdentityModel.Tokens.Jwt;
+using System.Security.Claims;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Microsoft.IdentityModel.Tokens;
+using StudioCRM.Application.DTOs.Auth;
+using StudioCRM.Application.DTOs.Public;
+using StudioCRM.Application.Interfaces;
+using StudioCRM.Application.Interfaces.Mail;
+using StudioCRM.Application.Settings;
+using StudioCRM.Domain.Entities;
+using StudioCRM.Infrastructure.Persistence;
+using StudioCRM.Application.Common;
+
+namespace StudioCRM.Infrastructure.Services;
+
+public partial class AuthService : IAuthService
+{
+    private readonly StudioCRMDbContext _context;
+    private readonly JwtSettings _jwtSettings;
+    private readonly AppSettings _appSettings;
+    private readonly IEmailService _emailService;
+    private readonly ILogger<AuthService> _logger;
+    private readonly PasswordHasher<User> _passwordHasher;
+    private readonly OrganizationDbContextFactory? _organizationContexts;
+
+    public AuthService(
+        StudioCRMDbContext context,
+        IOptions<JwtSettings> jwtOptions,
+        IOptions<AppSettings> appOptions,
+        IEmailService emailService,
+        ILogger<AuthService> logger, OrganizationDbContextFactory? organizationContexts = null)
+    {
+        _context = context;
+        _organizationContexts = organizationContexts;
+        _jwtSettings = jwtOptions.Value;
+        _appSettings = appOptions.Value;
+        _emailService = emailService;
+        _logger = logger;
+        _passwordHasher = new PasswordHasher<User>();
+    }
+
+    public async Task<CreatedAccountDto> RegisterAsync(RegisterDto request)
+    {
+        await using var ownedTransaction = _context.Database.CurrentTransaction == null
+            ? await _context.Database.BeginTransactionAsync() : null;
+        var result = await RegisterAsyncCore(request);
+        if (ownedTransaction != null) await ownedTransaction.CommitAsync();
+        return result;
+    }
+
+    private async Task<CreatedAccountDto> RegisterAsyncCore(RegisterDto request)
+    {
+        var legacy = _context.OrganizationId == StudioCRMDbContext.LegacyOrganizationId;
+        if (legacy) await LegacyStaffMembership.RequireLegacyAsync(_context);
+        else if (!await _context.Organizations.AnyAsync(o => o.Id == _context.OrganizationId && o.Status == "Active"))
+            throw new InvalidOperationException("Organization is not active.");
+        var email = request.Email.Trim();
+        var roleName = NormalizeManualRegistrationRole(request.Role);
+
+        if (string.IsNullOrWhiteSpace(email))
+        {
+            throw new InvalidOperationException("Email is required.");
+        }
+
+        if (string.IsNullOrWhiteSpace(request.Password))
+        {
+            throw new InvalidOperationException("Password is required.");
+        }
+
+        if (!request.LocationId.HasValue)
+        {
+            throw new InvalidOperationException("LocationId is required.");
+        }
+
+        var existingUser = await _context.Users
+            .AnyAsync(u => u.Email == email);
+
+        if (existingUser)
+        {
+            throw new InvalidOperationException("User with this email already exists.");
+        }
+
+        var locationExists = await _context.Locations
+            .AnyAsync(l => l.Id == request.LocationId.Value);
+
+        if (!locationExists)
+        {
+            throw new InvalidOperationException("Location does not exist.");
+        }
+
+        var role = await _context.Roles
+            .FirstOrDefaultAsync(r => r.Name == roleName);
+
+        if (role is null)
+        {
+            throw new InvalidOperationException($"{roleName} role does not exist.");
+        }
+
+        Trainer? assignedTrainer = null;
+
+        if (roleName == "Client" && request.TrainerId.HasValue)
+        {
+            assignedTrainer = await _context.Trainers
+                .Include(t => t.TrainerLocations)
+                .FirstOrDefaultAsync(t => t.Id == request.TrainerId.Value && !t.IsDeleted);
+
+            if (assignedTrainer is null)
+            {
+                throw new InvalidOperationException("Trainer does not exist.");
+            }
+
+            var trainerHasLocation = assignedTrainer.TrainerLocations
+                .Any(tl => tl.LocationId == request.LocationId.Value);
+
+            if (!trainerHasLocation)
+            {
+                throw new InvalidOperationException("Trainer is not assigned to this location.");
+            }
+        }
+
+        var now = DateTime.UtcNow;
+        var user = new User
+        {
+            Email = email,
+            FirstName = request.FirstName.Trim(),
+            LastName = request.LastName.Trim(),
+            IsActive = true,
+            EmailVerifiedAt = now,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+
+        user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
+
+        await _context.Users.AddAsync(user);
+        await _context.SaveChangesAsync();
+
+        if (legacy) await _context.UserRoles.AddAsync(new UserRole
+        {
+            UserId = user.Id,
+            RoleId = role.Id
+        });
+
+        if (legacy) await LegacyStaffMembership.TrackAsync(_context, user.Id, roleName);
+        else if (roleName == "Trainer") _context.Add(new OrganizationMembership { OrganizationId = _context.OrganizationId, UserId = user.Id, IsTrainer = true, CreatedAt = now });
+
+        int? clientId = null;
+        int? trainerId = null;
+
+        if (roleName == "Trainer")
+        {
+            var trainer = new Trainer
+            {
+                UserId = user.Id,
+                Status = "Active",
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+
+            await _context.Trainers.AddAsync(trainer);
+            await _context.SaveChangesAsync();
+
+            await _context.TrainerLocations.AddAsync(new TrainerLocation
+            {
+                TrainerId = trainer.Id,
+                LocationId = request.LocationId.Value
+            });
+
+            trainerId = trainer.Id;
+        }
+        else
+        {
+            var client = new Client
+            {
+                UserId = user.Id,
+                TrainerId = assignedTrainer?.Id,
+                LocationId = request.LocationId.Value,
+                FirstName = user.FirstName,
+                LastName = user.LastName,
+                Email = user.Email,
+                BillingStatus = "Pending",
+                Status = "Inactive",
+                TrainingStartDate = StudioMonth.TodayAsStoredDate(now),
+                SubscriptionAutoRenewEnabled = true,
+                CreatedAt = now,
+                UpdatedAt = now
+            };
+
+            await _context.Clients.AddAsync(client);
+            await _context.SaveChangesAsync();
+
+            clientId = client.Id;
+        }
+
+        await _context.SaveChangesAsync();
+
+        return new CreatedAccountDto
+        {
+            UserId = user.Id,
+            Email = user.Email,
+            Role = roleName,
+            ClientId = clientId,
+            TrainerId = trainerId,
+            LocationId = request.LocationId
+        };
+    }
+
+    public async Task<AuthResponseDto> RegisterPublicGroupClientAsync(PublicGroupRegisterRequest request)
+    {
+        await LegacyStaffMembership.RequireLegacyAsync(_context);
+        var email = request.Email.Trim();
+
+        if (string.IsNullOrWhiteSpace(email))
+            throw new InvalidOperationException("Email is required.");
+
+        if (string.IsNullOrWhiteSpace(request.Password))
+            throw new InvalidOperationException("Password is required.");
+
+        if (string.IsNullOrWhiteSpace(request.FirstName) || string.IsNullOrWhiteSpace(request.LastName))
+            throw new InvalidOperationException("First name and last name are required.");
+
+        var existingUser = await _context.Users
+            .AnyAsync(u => u.Email == email);
+
+        if (existingUser)
+            throw new InvalidOperationException("User with this email already exists.");
+
+        if (await _context.Clients.IncludingOrganizationArchive(_context.OrganizationId).AnyAsync(c => c.Email.ToLower() == email.ToLower()))
+            throw new InvalidOperationException("A client profile with this email already exists. Ask the studio for a portal invitation.");
+        var locationExists = await _context.Locations
+            .AnyAsync(l => l.Id == request.LocationId && l.IsActive);
+
+        if (!locationExists)
+            throw new InvalidOperationException("Location does not exist.");
+
+        var legalRequirements = await LegalConsentManager.GetRequirementsAsync(_context, request.LocationId);
+        if (legalRequirements.AcceptanceRequired &&
+            (!request.AcceptTerms || !string.Equals(
+                request.TermsVersion?.Trim(),
+                legalRequirements.TermsVersion,
+                StringComparison.Ordinal)))
+        {
+            throw new InvalidOperationException("Current terms must be accepted before registration.");
+        }
+
+        var role = await _context.Roles
+            .FirstOrDefaultAsync(r => r.Name == "Client");
+
+        if (role is null)
+            throw new InvalidOperationException("Client role does not exist.");
+
+        var now = DateTime.UtcNow;
+        var user = new User
+        {
+            Email = email,
+            FirstName = request.FirstName.Trim(),
+            LastName = request.LastName.Trim(),
+            IsActive = true,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+
+        user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
+
+        await _context.Users.AddAsync(user);
+        await _context.SaveChangesAsync();
+
+        await _context.UserRoles.AddAsync(new UserRole
+        {
+            UserId = user.Id,
+            RoleId = role.Id
+        });
+
+        var client = new Client
+        {
+            UserId = user.Id,
+            TrainerId = null,
+            LocationId = request.LocationId,
+            FirstName = user.FirstName,
+            LastName = user.LastName,
+            Email = user.Email,
+            PhoneNumber = request.PhoneNumber,
+            BillingStatus = "Pending",
+            Source = "PublicGroupSignup",
+            Status = "Inactive",
+            TrainingStartDate = StudioMonth.TodayAsStoredDate(now),
+            SubscriptionAutoRenewEnabled = false,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+
+        await _context.Clients.AddAsync(client);
+        await _context.ClientLocationMemberships.AddAsync(new ClientLocationMembership
+        {
+            Client = client,
+            LocationId = request.LocationId,
+            IsHomeLocation = true,
+            GroupAccessEnabled = true,
+            Source = "PublicGroupSignup",
+            JoinedAt = now,
+            UpdatedAt = now
+        });
+
+        var refreshToken = GenerateRefreshToken();
+
+        await _context.RefreshTokens.AddAsync(new RefreshToken
+        {
+            UserId = user.Id,
+            Token = SecretTokens.Hash(refreshToken),
+            OrganizationId = SessionOrganization(user),
+            ScopeVersion = 1,
+            ExpiresAt = DateTime.UtcNow.AddDays(7),
+            CreatedAt = DateTime.UtcNow
+        });
+
+        await LegalConsentManager.AcceptAsync(
+            _context,
+            user.Id,
+            request.LocationId,
+            request.AcceptTerms,
+            request.TermsVersion,
+            "PublicGroupRegistration");
+
+        var emailVerificationToken = await CreateEmailVerificationTokenAsync(user.Id);
+
+        await _context.SaveChangesAsync();
+
+        var clientName = $"{client.FirstName} {client.LastName}".Trim();
+        var registrationSourceKey = $"public-group-registration:{user.Id}";
+        await NotificationWriter.QueueAsync(
+            _context,
+            new[] { user.Id },
+            registrationSourceKey,
+            "PublicGroupClientRegistered",
+            "Konto zostało utworzone",
+            "Potwierdź adres e-mail, aby kupić pakiet i zapisać się na zajęcia grupowe.",
+            relatedEntityType: "client",
+            relatedEntityId: client.Id,
+            actionUrl: "/group-classes",
+            createdAt: now);
+        await NotificationWriter.QueueForOwnersAsync(
+            _context,
+            registrationSourceKey,
+            "PublicGroupClientRegistered",
+            "Nowa rejestracja na zajęcia grupowe",
+            $"{clientName} ({client.Email})",
+            relatedEntityType: "client",
+            relatedEntityId: client.Id,
+            actionUrl: $"/clients/{client.Id}/workspace",
+            createdAt: now);
+        await _context.SaveChangesAsync();
+
+        try
+        {
+            var verificationLink = BuildFrontendUrl("verify-email", ("token", emailVerificationToken));
+            await _emailService.SendEmailVerificationAsync(user.Email, verificationLink);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not send email verification to user {UserId}.", user.Id);
+        }
+
+        var registeredUser = await _context.Users
+            .Include(u => u.UserRoles)
+                .ThenInclude(ur => ur.Role)
+            .FirstAsync(u => u.Id == user.Id);
+
+        return await BuildAuthResponse(registeredUser, refreshToken);
+    }
+
+    public async Task<AuthResponseDto?> LoginAsync(LoginRequestDto request)
+    {
+        var user = await _context.Users
+            .Include(u => u.UserRoles)
+                .ThenInclude(ur => ur.Role)
+            .FirstOrDefaultAsync(u => u.Email == request.Email);
+
+        if (user != null && _organizationContexts != null)
+        {
+            var binding = await AccountOrganizationResolver.ResolveAsync(_context, user.Id);
+            if (!binding.CanAuthenticate) return null;
+            if (!binding.IsPlatformAdmin && binding.OrganizationId != _context.OrganizationId)
+            {
+                await using var studio = _organizationContexts.Create(binding.OrganizationId!.Value);
+                return await ForOrganization(studio).LoginAsync(request);
+            }
+        }
+        if (user is null || !user.IsActive || await ClientAccountAccess.IsBlockedAsync(_context, user.Id))
+        {
+            return null;
+        }
+
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        await _context.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock(74201, {user.Id})");
+        await _context.Entry(user).ReloadAsync();
+        if (!user.IsActive || await ClientAccountAccess.IsBlockedAsync(_context, user.Id)) return null;
+        var verificationResult = _passwordHasher.VerifyHashedPassword(
+            user,
+            user.PasswordHash,
+            request.Password);
+
+        if (verificationResult == PasswordVerificationResult.Failed)
+        {
+            return null;
+        }
+
+        if (!await AccountOrganizationResolver.MatchesContextAsync(_context, user.Id) ||
+            (await OrganizationAuthorization.RolesAsync(_context, user.Id)).Count == 0) return null;
+
+        user.LastLoginAt = DateTime.UtcNow;
+        user.UpdatedAt = DateTime.UtcNow;
+
+        var refreshToken = GenerateRefreshToken();
+
+        await _context.RefreshTokens.AddAsync(new RefreshToken
+        {
+            UserId = user.Id,
+            Token = SecretTokens.Hash(refreshToken),
+            OrganizationId = SessionOrganization(user),
+            ScopeVersion = 1,
+            ExpiresAt = DateTime.UtcNow.AddDays(7),
+            CreatedAt = DateTime.UtcNow
+        });
+
+        await _context.SaveChangesAsync();
+
+        await transaction.CommitAsync();
+        return await BuildAuthResponse(user, refreshToken);
+    }
+
+    public async Task<AuthMeDto?> GetMeAsync(int userId)
+    {
+        var user = await _context.Users
+            .Include(u => u.UserRoles)
+                .ThenInclude(ur => ur.Role)
+            .FirstOrDefaultAsync(u => u.Id == userId && u.IsActive);
+
+        if (user is null)
+        {
+            return null;
+        }
+
+        var roleNames = await OrganizationAuthorization.RolesAsync(_context, user.Id);
+
+        var client = await _context.Clients
+            .Where(c => c.UserId == user.Id)
+            .Select(c => new
+            {
+                c.Id,
+                c.TrainerId,
+                c.LocationId,
+                c.Source
+            })
+            .FirstOrDefaultAsync();
+
+        var trainer = await _context.Trainers
+            .Where(t => t.UserId == user.Id)
+            .Select(t => new
+            {
+                t.Id
+            })
+            .FirstOrDefaultAsync();
+
+        var primaryRole = roleNames.FirstOrDefault() ?? string.Empty;
+        return new AuthMeDto
+        {
+            UserId = user.Id,
+            Email = user.Email,
+            Role = primaryRole,
+            OrganizationId = roleNames.Contains("SuperAdmin") ? null : _context.OrganizationId,
+            Roles = roleNames,
+            FullName = $"{user.FirstName} {user.LastName}".Trim(),
+            AvatarUrl = user.AvatarUrl,
+            ClientId = client?.Id,
+            TrainerId = trainer?.Id,
+            LocationId = client?.LocationId,
+            ClientSource = client?.Source,
+            PortalAccessMode = client is null
+                ? null
+                : client.TrainerId.HasValue ? "FullCrm" : "GroupOnly",
+            EmailVerified = user.EmailVerifiedAt.HasValue
+        };
+    }
+
+    public async Task<AuthResponseDto> RefreshAsync(RefreshTokenRequestDto request)
+    {
+        // Tokens are stored hashed; plaintext rows from before the change still match until they expire.
+        var presentedHash = SecretTokens.Hash(request.RefreshToken);
+        var legacyAllowed = SecretTokens.CanBeLegacyPlaintext(request.RefreshToken);
+        if (_organizationContexts != null)
+        {
+            var stored = await _context.RefreshTokens.AsNoTracking().Where(t => t.Token == presentedHash || (legacyAllowed && t.Token == request.RefreshToken))
+                .Select(t => new { t.UserId, t.OrganizationId, t.ScopeVersion }).SingleOrDefaultAsync();
+            if (stored != null)
+            {
+                var binding = await AccountOrganizationResolver.ResolveAsync(_context, stored.UserId);
+                if (!binding.CanAuthenticate) throw new InvalidOperationException("Invalid refresh token.");
+                if (!binding.IsPlatformAdmin && binding.OrganizationId != _context.OrganizationId)
+                {
+                    if (stored.ScopeVersion != 1 || stored.OrganizationId != binding.OrganizationId)
+                        throw new InvalidOperationException("Invalid refresh token scope.");
+                    await using var studio = _organizationContexts.Create(binding.OrganizationId!.Value);
+                    return await ForOrganization(studio).RefreshAsync(request);
+                }
+            }
+        }
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+
+        var refreshToken = await _context.RefreshTokens
+            .Include(rt => rt.User)
+                .ThenInclude(u => u.UserRoles)
+                    .ThenInclude(ur => ur.Role)
+            .FirstOrDefaultAsync(rt => rt.Token == presentedHash || (legacyAllowed && rt.Token == request.RefreshToken));
+
+        if (refreshToken is null || !refreshToken.IsActive || !refreshToken.User.IsActive ||
+            await ClientAccountAccess.IsBlockedAsync(_context, refreshToken.UserId))
+        {
+            throw new InvalidOperationException("Invalid refresh token.");
+        }
+
+        await _context.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock(74201, {refreshToken.UserId})");
+        await _context.Entry(refreshToken).ReloadAsync();
+        await _context.Entry(refreshToken.User).ReloadAsync();
+        if (!refreshToken.IsActive || !refreshToken.User.IsActive)
+            throw new InvalidOperationException("Invalid refresh token.");
+        ValidateRefreshScope(refreshToken);
+        if (!await AccountOrganizationResolver.MatchesContextAsync(_context, refreshToken.UserId) ||
+            (await OrganizationAuthorization.RolesAsync(_context, refreshToken.UserId)).Count == 0)
+            throw new InvalidOperationException("Invalid refresh token.");
+        refreshToken.RevokedAt = DateTime.UtcNow;
+
+        var newRefreshToken = GenerateRefreshToken();
+
+        await _context.RefreshTokens.AddAsync(new RefreshToken
+        {
+            UserId = refreshToken.UserId,
+            Token = SecretTokens.Hash(newRefreshToken),
+            OrganizationId = SessionOrganization(refreshToken.User),
+            ScopeVersion = 1,
+            ExpiresAt = DateTime.UtcNow.AddDays(7),
+            CreatedAt = DateTime.UtcNow
+        });
+
+        refreshToken.User.UpdatedAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync();
+
+        await transaction.CommitAsync();
+        return await BuildAuthResponse(refreshToken.User, newRefreshToken);
+    }
+
+    public async Task LogoutAsync(int userId)
+    {
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        await _context.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock(74201, {userId})");
+        await _context.Users.Where(u => u.Id == userId)
+            .ExecuteUpdateAsync(s => s.SetProperty(u => u.AuthVersion, u => u.AuthVersion + 1));
+        await _context.RefreshTokens.Where(t => t.UserId == userId && t.RevokedAt == null)
+            .ExecuteUpdateAsync(s => s.SetProperty(t => t.RevokedAt, DateTime.UtcNow));
+        await transaction.CommitAsync();
+    }
+
+    public async Task ForgotPasswordAsync(ForgotPasswordDto request)
+    {
+        var email = request.Email.Trim().ToLowerInvariant();
+
+        if (string.IsNullOrWhiteSpace(email))
+            return;
+
+        var user = await _context.Users
+            .FirstOrDefaultAsync(u => u.Email.ToLower() == email);
+
+        if (user is null)
+        {
+            return;
+        }
+
+        var token = GenerateResetToken();
+        var activeTokens = await _context.PasswordResetTokens
+            .Where(t =>
+                t.UserId == user.Id &&
+                !t.IsUsed &&
+                t.ExpiresAt > DateTime.UtcNow)
+            .ToListAsync();
+
+        foreach (var activeToken in activeTokens)
+        {
+            activeToken.IsUsed = true;
+        }
+
+        await _context.PasswordResetTokens.AddAsync(new PasswordResetToken
+        {
+            UserId = user.Id,
+            Token = SecretTokens.Hash(token),
+            ExpiresAt = DateTime.UtcNow.AddHours(1),
+            CreatedAt = DateTime.UtcNow,
+            IsUsed = false
+        });
+
+        await _context.SaveChangesAsync();
+
+        var resetLink = BuildFrontendUrl("reset-password", ("token", token));
+
+        await _emailService.SendPasswordResetEmailAsync(user.Email, resetLink);
+    }
+
+    public async Task ResetPasswordAsync(ResetPasswordDto request)
+    {
+        var presentedHash = SecretTokens.Hash(request.Token);
+        var legacyAllowed = SecretTokens.CanBeLegacyPlaintext(request.Token);
+        var resetToken = await _context.PasswordResetTokens
+            .Include(t => t.User)
+            .FirstOrDefaultAsync(t =>
+                (t.Token == presentedHash || (legacyAllowed && t.Token == request.Token)) &&
+                !t.IsUsed &&
+                t.ExpiresAt > DateTime.UtcNow);
+
+        if (resetToken is null)
+        {
+            throw new InvalidOperationException("Invalid or expired token.");
+        }
+
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        await _context.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock(74201, {resetToken.UserId})");
+        await _context.Entry(resetToken).ReloadAsync();
+        await _context.Entry(resetToken.User).ReloadAsync();
+        if (resetToken.IsUsed || resetToken.ExpiresAt <= DateTime.UtcNow || !resetToken.User.IsActive)
+            throw new InvalidOperationException("Invalid or expired token.");
+        resetToken.User.PasswordHash =
+            _passwordHasher.HashPassword(resetToken.User, request.NewPassword);
+
+        resetToken.User.UpdatedAt = DateTime.UtcNow;
+        resetToken.IsUsed = true;
+        resetToken.User.AuthVersion++;
+        await RevokeRefreshTokensAsync(resetToken.UserId);
+
+        await _context.SaveChangesAsync();
+        await transaction.CommitAsync();
+    }
+
+    public async Task ChangePasswordAsync(int userId, ChangePasswordDto request)
+    {
+        if (string.IsNullOrWhiteSpace(request.CurrentPassword))
+            throw new InvalidOperationException("Current password is required.");
+
+        if (string.IsNullOrWhiteSpace(request.NewPassword))
+            throw new InvalidOperationException("New password is required.");
+
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        await _context.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock(74201, {userId})");
+        var user = await _context.Users.FirstOrDefaultAsync(u => u.Id == userId && u.IsActive);
+        if (user is null)
+            throw new InvalidOperationException("User does not exist.");
+
+        var verificationResult = _passwordHasher.VerifyHashedPassword(
+            user,
+            user.PasswordHash,
+            request.CurrentPassword);
+
+        if (verificationResult == PasswordVerificationResult.Failed)
+            throw new InvalidOperationException("Current password is incorrect.");
+
+        user.AuthVersion++;
+        await RevokeRefreshTokensAsync(user.Id);
+        user.PasswordHash = _passwordHasher.HashPassword(user, request.NewPassword);
+        user.UpdatedAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync();
+        await transaction.CommitAsync();
+    }
+
+    public async Task VerifyEmailAsync(VerifyEmailRequest request)
+    {
+        var tokenHash = HashEmailVerificationToken(request.Token);
+        var verificationToken = await _context.EmailVerificationTokens
+            .Include(x => x.User)
+            .FirstOrDefaultAsync(x =>
+                x.TokenHash == tokenHash &&
+                x.UsedAt == null &&
+                x.ExpiresAt > DateTime.UtcNow);
+
+        if (verificationToken is null)
+            throw new InvalidOperationException("Invalid or expired email verification token.");
+
+        var now = DateTime.UtcNow;
+        verificationToken.UsedAt = now;
+        verificationToken.User.EmailVerifiedAt ??= now;
+        verificationToken.User.UpdatedAt = now;
+
+        var otherTokens = await _context.EmailVerificationTokens
+            .Where(x => x.UserId == verificationToken.UserId && x.Id != verificationToken.Id && x.UsedAt == null)
+            .ToListAsync();
+        foreach (var otherToken in otherTokens)
+            otherToken.UsedAt = now;
+
+        await _context.SaveChangesAsync();
+    }
+
+    public async Task ResendEmailVerificationAsync(ResendEmailVerificationRequest request)
+    {
+        var email = request.Email.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(email))
+            return;
+
+        var user = await _context.Users.FirstOrDefaultAsync(x => x.Email.ToLower() == email && x.IsActive);
+        if (user is null || user.EmailVerifiedAt.HasValue)
+            return;
+
+        var recentlyCreated = await _context.EmailVerificationTokens.AnyAsync(x =>
+            x.UserId == user.Id &&
+            x.UsedAt == null &&
+            x.CreatedAt > DateTime.UtcNow.AddMinutes(-1));
+        if (recentlyCreated)
+            return;
+
+        var rawToken = await CreateEmailVerificationTokenAsync(user.Id);
+        await _context.SaveChangesAsync();
+
+        var verificationLink = BuildFrontendUrl("verify-email", ("token", rawToken));
+        await _emailService.SendEmailVerificationAsync(user.Email, verificationLink);
+    }
+
+    private AuthService ForOrganization(StudioCRMDbContext db) => new(db, Options.Create(_jwtSettings),
+        Options.Create(_appSettings), _emailService, _logger);
+
+    private Guid? SessionOrganization(User user) => user.UserRoles.Any(r => r.Role.Name == "SuperAdmin")
+        ? null : _context.OrganizationId;
+
+    private void ValidateRefreshScope(RefreshToken token)
+    {
+        // The legacy deployment may rotate old tokens into an explicitly scoped session.
+        // Future tenant selection must never infer a context from the current request alone.
+        if (token.ScopeVersion == 0)
+        {
+            if (token.OrganizationId != null || _context.OrganizationId != StudioCRMDbContext.LegacyOrganizationId)
+                throw new InvalidOperationException("Invalid refresh token scope.");
+            return;
+        }
+        if (token.ScopeVersion != 1 || token.OrganizationId != SessionOrganization(token.User))
+            throw new InvalidOperationException("Invalid refresh token scope.");
+    }
+    private async Task<AuthResponseDto> BuildAuthResponse(User user, string refreshToken)
+    {
+        var roleNames = await OrganizationAuthorization.RolesAsync(_context, user.Id);
+
+        if (roleNames.Count == 0) throw new InvalidOperationException("Account has no access to this organization.");
+        var primaryRole = roleNames[0];
+
+        var token = GenerateJwtToken(user, roleNames);
+
+        return new AuthResponseDto
+        {
+            Token = token,
+            RefreshToken = refreshToken,
+            UserId = user.Id,
+            Email = user.Email,
+            Role = primaryRole,
+            OrganizationId = roleNames.Contains("SuperAdmin") ? null : _context.OrganizationId,
+            EmailVerified = user.EmailVerifiedAt.HasValue,
+            EmailVerificationRequired = !user.EmailVerifiedAt.HasValue
+        };
+    }
+
+    private string GenerateJwtToken(User user, List<string> roleNames)
+    {
+        var claims = new List<Claim>
+        {
+            new Claim("auth_version", user.AuthVersion.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+            new Claim(JwtRegisteredClaimNames.Sub, user.Id.ToString()),
+            new Claim(JwtRegisteredClaimNames.Email, user.Email),
+            new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
+            new Claim(ClaimTypes.Name, user.Email)
+        };
+
+        if (!roleNames.Contains("SuperAdmin"))
+            claims.Add(new Claim("organization_id", _context.OrganizationId.ToString()));
+
+        foreach (var role in roleNames)
+        {
+            claims.Add(new Claim(ClaimTypes.Role, role));
+        }
+
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(_jwtSettings.Key));
+        var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
+
+        var token = new JwtSecurityToken(
+            issuer: _jwtSettings.Issuer,
+            audience: _jwtSettings.Audience,
+            claims: claims,
+            expires: DateTime.UtcNow.AddMinutes(_jwtSettings.ExpiryInMinutes),
+            signingCredentials: creds);
+
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+
+    private async Task RevokeRefreshTokensAsync(int userId)
+    {
+        var tokens = await _context.RefreshTokens.Where(t => t.UserId == userId && t.RevokedAt == null).ToListAsync();
+        foreach (var token in tokens) token.RevokedAt = DateTime.UtcNow;
+    }
+
+    private static string GenerateRefreshToken()
+    {
+        var randomBytes = RandomNumberGenerator.GetBytes(64);
+        return Convert.ToBase64String(randomBytes);
+    }
+
+    private static string GenerateResetToken()
+    {
+        var randomBytes = RandomNumberGenerator.GetBytes(64);
+        return Convert.ToBase64String(randomBytes);
+    }
+
+    private async Task<string> CreateEmailVerificationTokenAsync(int userId)
+    {
+        var now = DateTime.UtcNow;
+        var activeTokens = await _context.EmailVerificationTokens
+            .Where(x => x.UserId == userId && x.UsedAt == null)
+            .ToListAsync();
+        foreach (var activeToken in activeTokens)
+            activeToken.UsedAt = now;
+
+        var rawToken = Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant();
+        await _context.EmailVerificationTokens.AddAsync(new EmailVerificationToken
+        {
+            UserId = userId,
+            TokenHash = HashEmailVerificationToken(rawToken),
+            CreatedAt = now,
+            ExpiresAt = now.AddHours(24)
+        });
+
+        return rawToken;
+    }
+
+    private static string HashEmailVerificationToken(string? token)
+    {
+        if (string.IsNullOrWhiteSpace(token))
+            return string.Empty;
+
+        return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(token.Trim())))
+            .ToLowerInvariant();
+    }
+
+    private string BuildFrontendUrl(
+        string path,
+        params (string Key, string Value)[] queryParameters)
+    {
+        var baseUrl = _appSettings.FrontendBaseUrl.TrimEnd('/');
+        var normalizedPath = path.TrimStart('/');
+        var queryString = string.Join(
+            "&",
+            queryParameters.Select(x =>
+                $"{Uri.EscapeDataString(x.Key)}={Uri.EscapeDataString(x.Value)}"));
+
+        return string.IsNullOrWhiteSpace(queryString)
+            ? $"{baseUrl}/{normalizedPath}"
+            : $"{baseUrl}/{normalizedPath}?{queryString}";
+    }
+
+    private static string NormalizeManualRegistrationRole(string? role)
+    {
+        return role?.Trim().ToLowerInvariant() switch
+        {
+            "trainer" => "Trainer",
+            "client" => "Client",
+            _ => throw new InvalidOperationException("Manual account creation supports only Client or Trainer roles.")
+        };
+    }
+}

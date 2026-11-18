@@ -1,0 +1,57 @@
+using Microsoft.EntityFrameworkCore;
+using Npgsql;
+using StudioCRM.Infrastructure.Persistence;
+
+namespace StudioCRM.Tests.IntegrationTests;
+
+internal sealed class TestDatabase : IAsyncDisposable
+{
+    private readonly string schema = "crm_test_" + Guid.NewGuid().ToString("N");
+    private readonly string connectionString;
+    private TestDatabase(string connectionString) => this.connectionString = connectionString;
+    public StudioCRMDbContext Context(StudioCRM.Application.Interfaces.ICurrentUserService? currentUser = null,
+        StudioCRM.Application.Settings.OutlookSettings? outlookSettings = null, Microsoft.EntityFrameworkCore.Diagnostics.IInterceptor? interceptor = null, Guid? organizationId = null)
+    {
+        var builder = new NpgsqlConnectionStringBuilder(connectionString) { SearchPath = schema, Pooling = false, IncludeErrorDetail = false };
+        var options = new DbContextOptionsBuilder<StudioCRMDbContext>().UseNpgsql(builder.ConnectionString);
+        if (interceptor != null) options.AddInterceptors(interceptor);
+        return new(options.Options,
+            outlookSettings == null ? null : Microsoft.Extensions.Options.Options.Create(outlookSettings), currentUser, organizationId);
+    }
+    public static async Task<TestDatabase> CreateAsync()
+    {
+        var database = new TestDatabase(Environment.GetEnvironmentVariable("TPAY_TEST_DB")!);
+        await using var connection = new NpgsqlConnection(database.connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand($"CREATE SCHEMA {database.schema}", connection);
+        await command.ExecuteNonQueryAsync();
+        try
+        {
+            await using var context = database.Context();
+            await context.Database.OpenConnectionAsync();
+            await using var create = context.Database.GetDbConnection().CreateCommand();
+            // Execute generated DDL literally: JSON defaults can contain braces.
+            create.CommandText = context.Database.GenerateCreateScript();
+            await create.ExecuteNonQueryAsync();
+            return database;
+        }
+        catch { await database.DisposeAsync(); throw; }
+    }
+    public async ValueTask DisposeAsync()
+    {
+        // Only the randomly named schema created by this test is removed; application data is untouched.
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand($"DROP SCHEMA {schema} CASCADE", connection);
+        await command.ExecuteNonQueryAsync();
+    }
+}
+
+public sealed class PostgresFactAttribute : FactAttribute
+{
+    public PostgresFactAttribute()
+    {
+        if (string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TPAY_TEST_DB")))
+            Skip = "Set TPAY_TEST_DB to run isolated PostgreSQL integration tests.";
+    }
+}

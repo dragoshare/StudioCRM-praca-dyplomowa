@@ -1,0 +1,54 @@
+using StudioCRM.Application.Common;
+using StudioCRM.Application.DTOs.Sessions;
+using StudioCRM.Domain.Entities;
+using StudioCRM.Infrastructure.Services;
+
+namespace StudioCRM.Tests.UnitTests;
+
+public class ConsultationSessionTests
+{
+    [Theory]
+    [InlineData("[\"Anna Nowak\",\"Konsultacje\"]", true)]
+    [InlineData("[\"konsultacje \"]", true)]
+    [InlineData("[\"Anna Nowak\"]", false)]
+    [InlineData("not json", false)]
+    [InlineData(null, false)]
+    public void ConsultationIsRecognisedByOutlookCategory(string? categoriesJson, bool expected)
+        => Assert.Equal(expected, ConsultationSessions.HasOutlookCategory(categoriesJson));
+
+    [Fact]
+    public void ConsultationKeepsItsOwnTitleInsteadOfClientNames()
+    {
+        Assert.False(SessionTitleBuilder.ShouldDeriveFromParticipants(false, ConsultationSessions.SessionType));
+        var session = new Session { Title = "Magdalena M [KŁAJ]", PlannedSessionType = ConsultationSessions.SessionType };
+        Assert.Equal("Magdalena M [KŁAJ] - Konsultacja", SessionTitleBuilder.BuildOutlookSubject(session));
+    }
+
+    // Outlook shows "Title - Konsultacja" (or just "Konsultacja"); the suffix is never copied back nor doubled.
+    [Theory]
+    [InlineData("Anna T", "Anna T", "Anna T - Konsultacja")]
+    [InlineData("Anna T - Konsultacja", "Anna T", "Anna T - Konsultacja")]
+    [InlineData("Anna T - konsultacja - Konsultacja", "Anna T", "Anna T - Konsultacja")]
+    [InlineData("Konsultacja", "Konsultacja", "Konsultacja")]
+    [InlineData("", "Konsultacja", "Konsultacja")]
+    [InlineData(null, "Konsultacja", "Konsultacja")]
+    public void OutlookSubjectSuffixMarksConsultation(string? subject, string crmTitle, string outlookSubject)
+    {
+        Assert.Equal(crmTitle, ConsultationSessions.StripOutlookSubjectSuffix(subject));
+        Assert.Equal(outlookSubject, ConsultationSessions.BuildOutlookSubject(subject));
+    }
+
+    // Editing a completed consultation (e.g. changing its trainer) completes it again without participants.
+    [Fact]
+    public void EditedCompletedConsultationIsCompletedWithoutParticipants()
+    {
+        var request = new UpdateSessionDto
+        {
+            PlannedSessionType = ConsultationSessions.SessionType, Participants = new(), CorrectionReason = "inny trener"
+        };
+        var completion = SessionService.BuildCompletionRequest(request);
+        Assert.Equal(ConsultationSessions.SessionType, completion.ActualSessionType);
+        Assert.Empty(completion.Participants);
+        Assert.Equal("inny trener", completion.CorrectionReason);
+    }
+}

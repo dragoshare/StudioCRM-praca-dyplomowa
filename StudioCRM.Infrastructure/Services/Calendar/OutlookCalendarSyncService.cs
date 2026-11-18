@@ -1,0 +1,1203 @@
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using StudioCRM.Application.Common;
+using StudioCRM.Application.DTOs.Sessions;
+using StudioCRM.Application.Interfaces.Calendar;
+using StudioCRM.Application.Settings;
+using StudioCRM.Domain.Entities;
+using StudioCRM.Infrastructure.Persistence;
+
+namespace StudioCRM.Infrastructure.Services.Calendar;
+
+public class OutlookCalendarSyncService : IOutlookCalendarSyncService
+{
+    private const string OutlookStudioTimeZone = "Central European Standard Time";
+
+    private readonly StudioCRMDbContext _context;
+    private readonly OutlookSettings _settings;
+    private readonly HttpClient _httpClient;
+    private readonly ILogger<OutlookCalendarSyncService> _logger;
+
+    public OutlookCalendarSyncService(
+        StudioCRMDbContext context,
+        IOptions<OutlookSettings> options,
+        HttpClient httpClient,
+        ILogger<OutlookCalendarSyncService> logger)
+    {
+        _context = context;
+        _settings = options.Value;
+        _httpClient = httpClient;
+        _logger = logger;
+    }
+
+    public async Task SyncSessionAsync(int sessionId)
+    {
+        ThrowIfEmergencyStop();
+        var session = await _context.Sessions
+            .Include(s => s.Trainer)
+                .ThenInclude(t => t.User)
+            .Include(s => s.Participants)
+            .ThenInclude(p => p.Client)
+            .Include(s => s.Location)
+            .FirstOrDefaultAsync(s => s.Id == sessionId);
+
+        if (session is null)
+            throw new InvalidOperationException("Session does not exist.");
+
+        var existingLink = await _context.CalendarEventLinks
+            .Include(x => x.CalendarIntegration)
+            .FirstOrDefaultAsync(x => x.SessionId == session.Id && x.Provider == "Outlook");
+        var categoryTrainer = await OutlookTrainerCategoryResolver.ResolveAsync(
+            _context, session.OutlookCategoriesJson, session.LocationId);
+        // A category changes the instructor, not ownership of the Outlook event.
+        var integration = existingLink != null && categoryTrainer.Trainer?.Id == session.TrainerId
+            ? existingLink.CalendarIntegration
+            : await GetTrainerIntegrationAsync(session.Trainer.UserId);
+
+        if (integration is null || !integration.IsActive)
+            throw new InvalidOperationException("Trainer does not have active Outlook integration.");
+
+        if (!OutlookWriteGuard.TryAcquire(OutlookWriteGuard.SessionKey(_context.OrganizationId, session.Id)))
+        {
+            _logger.LogError(
+                "Outlook sync of session {SessionId} skipped: more than {PerMinute} writes in a minute or {PerHour} in an hour (each one e-mails the attendees).",
+                session.Id, OutlookWriteGuard.MaxWritesPerMinute, OutlookWriteGuard.MaxWritesPerHour);
+            return;
+        }
+
+        await EnsureAccessTokenAsync(integration);
+        (CalendarIntegration Integration, string ExternalEventId)? movedFrom = null;
+
+        if (existingLink is null)
+        {
+            var existingExternalEvent = await _context.ExternalCalendarEvents
+                .FirstOrDefaultAsync(x =>
+                    x.SessionId == session.Id &&
+                    x.Provider == "Outlook" &&
+                    x.CalendarIntegrationId == integration.Id &&
+                    x.ExternalEventId != string.Empty &&
+                    !x.Subject.StartsWith("[DELETED]"));
+
+            if (existingExternalEvent is not null)
+            {
+                existingLink = new CalendarEventLink
+                {
+                    SessionId = session.Id,
+                    CalendarIntegrationId = integration.Id,
+                    Provider = "Outlook",
+                    ExternalEventId = existingExternalEvent.ExternalEventId,
+                    SyncedAt = DateTime.UtcNow
+                };
+
+                await _context.CalendarEventLinks.AddAsync(existingLink);
+            }
+        }
+
+        if (existingLink is null)
+        {
+            var externalEventId = await CreateEventAsync(session, integration.AccessToken);
+
+            var link = new CalendarEventLink
+            {
+                SessionId = session.Id,
+                CalendarIntegrationId = integration.Id,
+                Provider = "Outlook",
+                ExternalEventId = externalEventId,
+                SyncedAt = DateTime.UtcNow
+            };
+
+            await _context.CalendarEventLinks.AddAsync(link);
+
+            await UpsertExternalCalendarEventAsync(session, integration.Id, externalEventId);
+        }
+        else
+        {
+            if (existingLink.CalendarIntegrationId != integration.Id)
+            {
+                // The new event first: a failed create leaves the session in the old calendar, not in none.
+                var externalEventId = await CreateEventAsync(session, integration.AccessToken);
+
+                // 2.11 (#1051): the old calendar's import row kept the session, so changing or deleting the leftover
+                // copy there moved or cancelled the session. It is unlinked before the old event is deleted.
+                movedFrom = (existingLink.CalendarIntegration
+                        ?? await _context.CalendarIntegrations.FirstAsync(x => x.Id == existingLink.CalendarIntegrationId),
+                    existingLink.ExternalEventId);
+                await UnlinkImportedEventAsync(session.Id, existingLink.CalendarIntegrationId, existingLink.ExternalEventId);
+
+                existingLink.CalendarIntegrationId = integration.Id;
+                existingLink.ExternalEventId = externalEventId;
+            }
+            else
+            {
+                var existingEventUpdated = await UpdateEventAsync(
+                    session,
+                    integration.AccessToken,
+                    existingLink.ExternalEventId);
+
+                if (!existingEventUpdated)
+                    existingLink.ExternalEventId = await CreateEventAsync(session, integration.AccessToken);
+            }
+
+            existingLink.SyncedAt = DateTime.UtcNow;
+
+            await UpsertExternalCalendarEventAsync(session, integration.Id, existingLink.ExternalEventId);
+        }
+
+        await _context.SaveChangesAsync();
+
+        if (movedFrom is { } previous && previous.Integration.IsActive)
+        {
+            try
+            {
+                await DeleteEventAsync(previous.Integration, previous.ExternalEventId);
+            }
+            catch (Exception ex)
+            {
+                // The session already lives in the new calendar; the unlinked copy can no longer change it.
+                _logger.LogWarning(ex, "Could not delete the previous Outlook event of moved session {SessionId}.", session.Id);
+            }
+        }
+    }
+
+    private async Task UnlinkImportedEventAsync(int sessionId, int calendarIntegrationId, string externalEventId)
+    {
+        var rows = await _context.ExternalCalendarEvents
+            .Where(x =>
+                x.SessionId == sessionId &&
+                x.CalendarIntegrationId == calendarIntegrationId &&
+                x.ExternalEventId == externalEventId)
+            .ToListAsync();
+        rows.ForEach(UnlinkDeletedEvent);
+    }
+
+    private static void UnlinkDeletedEvent(ExternalCalendarEvent calendarEvent)
+    {
+        if (!calendarEvent.Subject.StartsWith("[DELETED]", StringComparison.OrdinalIgnoreCase))
+            calendarEvent.Subject = "[DELETED] " + calendarEvent.Subject;
+        calendarEvent.SessionId = null;
+        calendarEvent.IsConvertedToSession = false;
+    }
+
+    public async Task SyncSessionSeriesAsync(
+        string recurringGroupId,
+        SessionRecurrenceDto recurrence)
+    {
+        ThrowIfEmergencyStop();
+        var sessions = await _context.Sessions
+            .Include(s => s.Trainer)
+                .ThenInclude(t => t.User)
+            .Include(s => s.Participants)
+                .ThenInclude(p => p.Client)
+            .Include(s => s.Location)
+            .Where(s => s.RecurringGroupId == recurringGroupId && s.IsRecurring)
+            .OrderBy(s => s.RecurrenceInstanceNumber)
+            .ToListAsync();
+
+        if (sessions.Count < 2)
+            throw new InvalidOperationException("Session series does not exist or has fewer than two occurrences.");
+
+        if (sessions.Select(s => s.TrainerId).Distinct().Count() != 1)
+            throw new InvalidOperationException("All sessions in an Outlook series must have the same trainer.");
+
+        var integration = await GetTrainerIntegrationAsync(sessions[0].Trainer.UserId)
+            ?? throw new InvalidOperationException("Trainer does not have active Outlook integration.");
+        await EnsureAccessTokenAsync(integration);
+
+        var sessionIds = sessions.Select(s => s.Id).ToList();
+        var alreadyLinkedCount = await _context.CalendarEventLinks.CountAsync(x =>
+            x.Provider == "Outlook" && sessionIds.Contains(x.SessionId));
+        if (alreadyLinkedCount == sessions.Count)
+            return;
+        if (alreadyLinkedCount > 0)
+            throw new InvalidOperationException("Session series is only partially linked to Outlook and requires reconciliation.");
+
+        var masterId = await CreateSeriesMasterEventAsync(sessions, recurrence, integration.AccessToken);
+        try
+        {
+            var instances = await GetSeriesInstancesWithRetryAsync(
+                masterId,
+                integration.AccessToken,
+                sessions[0].StartAt.AddDays(-1),
+                sessions[^1].EndAt.AddDays(1),
+                sessions.Count);
+
+            for (var index = 0; index < sessions.Count; index++)
+            {
+                var instance = instances[index];
+                if (Math.Abs((instance.StartAt - sessions[index].StartAt).TotalMinutes) > 1)
+                    throw new InvalidOperationException("Outlook occurrence dates do not match the CRM series.");
+            }
+
+            await SaveSeriesMappingsWithRetryAsync(
+                recurringGroupId,
+                integration.Id,
+                masterId,
+                instances);
+        }
+        catch
+        {
+            await TryDeleteEventAsync(masterId, integration.AccessToken);
+            throw;
+        }
+    }
+
+    private async Task SaveSeriesMappingsWithRetryAsync(
+        string recurringGroupId,
+        int integrationId,
+        string masterId,
+        List<OutlookSeriesInstance> instances)
+    {
+        Exception? lastError = null;
+
+        for (var attempt = 1; attempt <= 3; attempt++)
+        {
+            _context.ChangeTracker.Clear();
+
+            try
+            {
+                await using var transaction = await _context.Database.BeginTransactionAsync();
+                var sessions = await _context.Sessions
+                    .Include(session => session.Trainer)
+                        .ThenInclude(trainer => trainer.User)
+                    .Include(session => session.Participants)
+                        .ThenInclude(participant => participant.Client)
+                    .Include(session => session.Location)
+                    .Where(session =>
+                        session.RecurringGroupId == recurringGroupId &&
+                        session.IsRecurring)
+                    .OrderBy(session => session.RecurrenceInstanceNumber)
+                    .ToListAsync();
+
+                if (sessions.Count != instances.Count)
+                    throw new InvalidOperationException("CRM and Outlook series occurrence counts do not match.");
+
+                for (var index = 0; index < sessions.Count; index++)
+                {
+                    var session = sessions[index];
+                    var instance = instances[index];
+                    await UpsertSeriesExternalEventAsync(
+                        session,
+                        integrationId,
+                        instance.Id,
+                        masterId);
+                    await UpsertSeriesCalendarLinkAsync(
+                        session.Id,
+                        integrationId,
+                        instance.Id);
+                }
+
+                await _context.SaveChangesAsync();
+                await transaction.CommitAsync();
+                return;
+            }
+            catch (DbUpdateException ex) when (attempt < 3)
+            {
+                lastError = ex;
+                _logger.LogWarning(
+                    ex,
+                    "Outlook webhook raced with series {RecurringGroupId} mapping save. Retrying attempt {Attempt}.",
+                    recurringGroupId,
+                    attempt + 1);
+                await Task.Delay(TimeSpan.FromMilliseconds(250 * attempt));
+            }
+        }
+
+        throw new InvalidOperationException(
+            $"Could not persist Outlook series mappings: {lastError?.GetBaseException().Message}",
+            lastError);
+    }
+
+    private async Task UpsertSeriesCalendarLinkAsync(
+        int sessionId,
+        int integrationId,
+        string externalEventId)
+    {
+        const string provider = "Outlook";
+        var syncedAt = DateTime.UtcNow;
+        await _context.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO "CalendarEventLinks"
+                ("OrganizationId", "SessionId", "CalendarIntegrationId", "Provider", "ExternalEventId", "SyncedAt")
+            VALUES
+                ({_context.OrganizationId}, {sessionId}, {integrationId}, {provider}, {externalEventId}, {syncedAt})
+            ON CONFLICT ("SessionId", "Provider") DO UPDATE SET
+                "CalendarIntegrationId" = EXCLUDED."CalendarIntegrationId",
+                "ExternalEventId" = EXCLUDED."ExternalEventId",
+                "SyncedAt" = EXCLUDED."SyncedAt" WHERE "CalendarEventLinks"."OrganizationId" = EXCLUDED."OrganizationId";
+            """);
+    }
+
+    private async Task UpsertSeriesExternalEventAsync(
+        Session session,
+        int integrationId,
+        string externalEventId,
+        string masterId)
+    {
+        const string provider = "Outlook";
+        var categories = ResolveGraphEventCategories(session);
+        var categoryColors = ResolveGraphEventCategoryColors(session, categories);
+        var attendeesJson = JsonSerializer.Serialize(
+            session.Participants
+                .Select(participant => ClientCalendarAddress.Recipient(participant.Client, _settings))
+                .Where(email => !string.IsNullOrWhiteSpace(email))
+                .Distinct()
+                .ToList());
+        var categoriesJson = JsonSerializer.Serialize(categories);
+        var categoryColorsJson = JsonSerializer.Serialize(categoryColors);
+        var importedAt = DateTime.UtcNow;
+        string? organizerEmail = null;
+        string? mappingWarningsJson = null;
+
+        await _context.Database.ExecuteSqlInterpolatedAsync($"""
+            INSERT INTO "ExternalCalendarEvents"
+                ("OrganizationId", "CalendarIntegrationId", "Provider", "ExternalEventId", "Subject", "BodyPreview",
+                 "StartAt", "EndAt", "LocationName", "LocationEmail", "OrganizerEmail",
+                 "AttendeesJson", "MappingWarningsJson", "SeriesMasterId", "IsRecurring",
+                 "IsConvertedToSession", "SessionId", "ImportedAt", "CategoriesJson",
+                 "CategoryColorsJson")
+            VALUES
+                ({_context.OrganizationId}, {integrationId}, {provider}, {externalEventId}, {session.Title}, {session.Note},
+                 {session.StartAt}, {session.EndAt}, {session.Location.Name}, {session.Location.CalendarEmail}, {organizerEmail},
+                 {attendeesJson}, {mappingWarningsJson}, {masterId}, {true},
+                 {true}, {session.Id}, {importedAt}, {categoriesJson},
+                 {categoryColorsJson})
+            ON CONFLICT ("CalendarIntegrationId", "ExternalEventId") DO UPDATE SET
+                "Provider" = EXCLUDED."Provider",
+                "Subject" = EXCLUDED."Subject",
+                "BodyPreview" = EXCLUDED."BodyPreview",
+                "StartAt" = EXCLUDED."StartAt",
+                "EndAt" = EXCLUDED."EndAt",
+                "LocationName" = EXCLUDED."LocationName",
+                "LocationEmail" = EXCLUDED."LocationEmail",
+                "AttendeesJson" = EXCLUDED."AttendeesJson",
+                "SeriesMasterId" = EXCLUDED."SeriesMasterId",
+                "IsRecurring" = EXCLUDED."IsRecurring",
+                "IsConvertedToSession" = EXCLUDED."IsConvertedToSession",
+                "SessionId" = EXCLUDED."SessionId",
+                "ImportedAt" = EXCLUDED."ImportedAt",
+                "CategoriesJson" = EXCLUDED."CategoriesJson",
+                "CategoryColorsJson" = EXCLUDED."CategoryColorsJson" WHERE "ExternalCalendarEvents"."OrganizationId" = EXCLUDED."OrganizationId";
+            """);
+
+        session.OutlookCategoryColorsJson = categoryColorsJson;
+    }
+
+    public async Task DeleteSessionEventAsync(int sessionId)
+    {
+        var link = await _context.CalendarEventLinks
+            .Include(x => x.CalendarIntegration)
+            .FirstOrDefaultAsync(x =>
+                x.SessionId == sessionId &&
+                x.Provider == "Outlook");
+        // A session moved to another trainer's calendar can still have its old event there: every Outlook event
+        // pointing at the session goes, not only the linked one.
+        var importedEvents = await _context.ExternalCalendarEvents
+            .Include(x => x.CalendarIntegration)
+            .Where(x => x.SessionId == sessionId && x.Provider == "Outlook")
+            .ToListAsync();
+
+        var targets = importedEvents
+            .Where(x => x.ExternalEventId != string.Empty && !x.Subject.StartsWith("[DELETED]"))
+            .Select(x => (Integration: x.CalendarIntegration, x.ExternalEventId))
+            .ToList();
+        if (link is not null)
+        {
+            // Unchanged: a link to a disconnected calendar stays, the event cannot be deleted from here.
+            if (link.CalendarIntegration.IsActive)
+                targets.Insert(0, (link.CalendarIntegration, link.ExternalEventId));
+            else
+                link = null;
+        }
+
+        foreach (var target in targets
+            .Where(x => x.Integration.IsActive)
+            .DistinctBy(x => (x.Integration.Id, x.ExternalEventId)))
+        {
+            await DeleteEventAsync(target.Integration, target.ExternalEventId);
+        }
+
+        if (link is not null)
+            _context.CalendarEventLinks.Remove(link);
+        importedEvents.ForEach(UnlinkDeletedEvent);
+        await _context.SaveChangesAsync();
+    }
+
+    public async Task<bool> DeleteSessionSeriesAsync(string recurringGroupId)
+    {
+        var sessionIds = await _context.Sessions
+            .Where(session => session.RecurringGroupId == recurringGroupId && session.IsRecurring)
+            .Select(session => session.Id)
+            .ToListAsync();
+        if (sessionIds.Count == 0)
+            return false;
+
+        var links = await _context.CalendarEventLinks
+            .Include(link => link.CalendarIntegration)
+            .Where(link => link.Provider == "Outlook" && sessionIds.Contains(link.SessionId))
+            .ToListAsync();
+        var externalEvents = await _context.ExternalCalendarEvents
+            .Where(calendarEvent =>
+                calendarEvent.Provider == "Outlook" &&
+                calendarEvent.SessionId.HasValue &&
+                sessionIds.Contains(calendarEvent.SessionId.Value))
+            .ToListAsync();
+        var masterTargets = externalEvents
+            .Where(calendarEvent => !string.IsNullOrWhiteSpace(calendarEvent.SeriesMasterId))
+            .GroupBy(calendarEvent => new
+            {
+                calendarEvent.CalendarIntegrationId,
+                MasterId = calendarEvent.SeriesMasterId!
+            })
+            .Select(group => group.Key)
+            .ToList();
+        var deletedRemoteEvent = false;
+
+        foreach (var target in masterTargets)
+        {
+            var integration = links
+                .Select(link => link.CalendarIntegration)
+                .FirstOrDefault(item => item.Id == target.CalendarIntegrationId)
+                ?? await _context.CalendarIntegrations.FirstOrDefaultAsync(item =>
+                    item.Id == target.CalendarIntegrationId);
+            if (integration is null || !integration.IsActive)
+                throw new InvalidOperationException("Outlook integration for this series is not active.");
+
+            await DeleteEventAsync(integration, target.MasterId);
+            deletedRemoteEvent = true;
+        }
+
+        if (masterTargets.Count == 0)
+        {
+            foreach (var link in links.DistinctBy(item => item.ExternalEventId))
+            {
+                if (!link.CalendarIntegration.IsActive)
+                    throw new InvalidOperationException("Outlook integration for this series is not active.");
+
+                await DeleteEventAsync(link.CalendarIntegration, link.ExternalEventId);
+                deletedRemoteEvent = true;
+            }
+        }
+
+        _context.CalendarEventLinks.RemoveRange(links);
+        externalEvents.ForEach(UnlinkDeletedEvent);
+
+        await _context.SaveChangesAsync();
+        return deletedRemoteEvent;
+    }
+
+    private async Task<string> CreateEventAsync(Session session, string accessToken)
+    {
+        await PrepareRecipientsAsync(session);
+        var categories = ResolveGraphEventCategories(session);
+        await EnsureTrainerMasterCategoryAsync(session, accessToken, categories);
+        var payload = BuildGraphEventPayload(session, categories);
+        payload["transactionId"] = CrmOutlookEventMarker.Create(session.Id);
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            "https://graph.microsoft.com/v1.0/me/events");
+
+        request.Headers.Authorization =
+            new AuthenticationHeaderValue("Bearer", accessToken);
+
+        request.Content = new StringContent(
+            JsonSerializer.Serialize(payload),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await _httpClient.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Microsoft create event error: {body}");
+
+        using var doc = JsonDocument.Parse(body);
+
+        return doc.RootElement.GetProperty("id").GetString()
+            ?? throw new InvalidOperationException("Graph event id is missing.");
+    }
+
+    private async Task<bool> UpdateEventAsync(Session session, string accessToken, string eventId)
+    {
+        await PrepareRecipientsAsync(session);
+        if (_settings.UseCalendarEmails)
+        {
+            // Replacing real attendees can send cancellation emails to their old addresses.
+            // Require a separate, deliberate migration of legacy events instead.
+            using var read = new HttpRequestMessage(HttpMethod.Get,
+                $"https://graph.microsoft.com/v1.0/me/events/{eventId}?$select=attendees");
+            read.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            using var existing = await _httpClient.SendAsync(read);
+            if (existing.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.Gone)
+                return false;
+            existing.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await existing.Content.ReadAsStringAsync());
+            var addresses = document.RootElement.GetProperty("attendees").EnumerateArray()
+                .Where(a => a.GetProperty("type").GetString() != "resource")
+                .Select(a => a.GetProperty("emailAddress").GetProperty("address").GetString()!.ToLowerInvariant())
+                .ToList();
+            var known = await _context.Clients.IncludingOrganizationArchive(_context.OrganizationId)
+                .Where(c => c.CalendarEmail != null && addresses.Contains(c.CalendarEmail.ToLower()))
+                .Select(c => c.CalendarEmail!).ToListAsync();
+            if (addresses.Any(a => !known.Contains(a, StringComparer.OrdinalIgnoreCase)))
+                throw new InvalidOperationException("Legacy Outlook event has non-technical attendees. Migrate it explicitly before syncing; replacing attendees may notify real clients.");
+        }
+        var categories = ResolveGraphEventCategories(session);
+        await EnsureTrainerMasterCategoryAsync(session, accessToken, categories);
+        var payload = BuildGraphEventPayload(session, categories);
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Patch,
+            $"https://graph.microsoft.com/v1.0/me/events/{eventId}");
+
+        request.Headers.Authorization =
+            new AuthenticationHeaderValue("Bearer", accessToken);
+
+        request.Content = new StringContent(
+            JsonSerializer.Serialize(payload),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await _httpClient.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+
+        if (response.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.Gone)
+            return false;
+
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Microsoft update event error: {body}");
+
+        return true;
+    }
+
+    private async Task<string> CreateSeriesMasterEventAsync(
+        List<Session> sessions,
+        SessionRecurrenceDto recurrence,
+        string accessToken)
+    {
+        var first = sessions[0];
+        foreach (var session in sessions) await PrepareRecipientsAsync(session);
+        var categories = ResolveGraphEventCategories(first);
+        await EnsureTrainerMasterCategoryAsync(first, accessToken, categories);
+        var payload = BuildGraphEventPayload(first, categories);
+        var frequency = recurrence.Frequency.Trim().Equals("Daily", StringComparison.OrdinalIgnoreCase)
+            ? "daily"
+            : "weekly";
+        var pattern = new Dictionary<string, object?>
+        {
+            ["type"] = frequency,
+            ["interval"] = recurrence.Interval
+        };
+        if (frequency == "weekly")
+        {
+            pattern["daysOfWeek"] = (recurrence.DaysOfWeek?.Count > 0
+                    ? recurrence.DaysOfWeek
+                    : new List<string> { ToStudioLocalTime(first.StartAt).DayOfWeek.ToString() })
+                .Select(day => day.Trim().ToLowerInvariant())
+                .Distinct()
+                .ToList();
+            pattern["firstDayOfWeek"] = "monday";
+        }
+
+        payload["recurrence"] = new
+        {
+            pattern,
+            range = new
+            {
+                type = "numbered",
+                startDate = ToStudioLocalTime(first.StartAt).ToString("yyyy-MM-dd"),
+                numberOfOccurrences = sessions.Count,
+                recurrenceTimeZone = OutlookStudioTimeZone
+            }
+        };
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://graph.microsoft.com/v1.0/me/events");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        request.Content = new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json");
+        var response = await _httpClient.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Microsoft create recurring event error: {body}");
+
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.GetProperty("id").GetString()
+            ?? throw new InvalidOperationException("Graph recurring event id is missing.");
+    }
+
+    private async Task<List<OutlookSeriesInstance>> GetSeriesInstancesAsync(
+        string masterId,
+        string accessToken,
+        DateTime startAt,
+        DateTime endAt)
+    {
+        var url = $"https://graph.microsoft.com/v1.0/me/events/{masterId}/instances" +
+            $"?startDateTime={Uri.EscapeDataString(startAt.ToString("o"))}" +
+            $"&endDateTime={Uri.EscapeDataString(endAt.ToString("o"))}" +
+            "&$select=id,start&$top=999";
+        using var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+        var response = await _httpClient.SendAsync(request);
+        var body = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Microsoft recurring event instances error: {body}");
+
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.GetProperty("value")
+            .EnumerateArray()
+            .Select(item => new OutlookSeriesInstance
+            {
+                Id = item.GetProperty("id").GetString() ?? string.Empty,
+                StartAt = ReadGraphDateTime(item.GetProperty("start"))
+            })
+            .Where(item => !string.IsNullOrWhiteSpace(item.Id))
+            .OrderBy(item => item.StartAt)
+            .ToList();
+    }
+
+    private async Task<List<OutlookSeriesInstance>> GetSeriesInstancesWithRetryAsync(
+        string masterId,
+        string accessToken,
+        DateTime startAt,
+        DateTime endAt,
+        int expectedCount)
+    {
+        Exception? lastError = null;
+
+        for (var attempt = 1; attempt <= 5; attempt++)
+        {
+            try
+            {
+                var instances = await GetSeriesInstancesAsync(masterId, accessToken, startAt, endAt);
+                if (instances.Count == expectedCount)
+                    return instances;
+
+                lastError = new InvalidOperationException(
+                    $"Outlook returned {instances.Count} of {expectedCount} expected series occurrences.");
+            }
+            catch (Exception ex)
+            {
+                lastError = ex;
+            }
+
+            if (attempt < 5)
+                await Task.Delay(TimeSpan.FromMilliseconds(500 * attempt));
+        }
+
+        throw new InvalidOperationException(
+            $"Outlook did not make all recurring event occurrences available in time. {lastError?.Message}",
+            lastError);
+    }
+
+    private async Task TryDeleteEventAsync(string eventId, string accessToken)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Delete,
+                $"https://graph.microsoft.com/v1.0/me/events/{eventId}");
+            request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
+            await _httpClient.SendAsync(request);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not clean up Outlook series {EventId} after failed linking.", eventId);
+        }
+    }
+
+    private void ThrowIfEmergencyStop()
+    {
+        if (_settings.EmergencyStop)
+            throw new InvalidOperationException("Synchronizacja z Outlookiem jest awaryjnie wstrzymana (Outlook:EmergencyStop).");
+    }
+
+    private Dictionary<string, object?> BuildGraphEventPayload(Session session, List<string> categories)
+    {
+        var clientName = string.Join(" + ",
+             session.Participants.Select(p => $"{p.Client.FirstName} {p.Client.LastName}"));
+        var trainerName = $"{session.Trainer.User.FirstName} {session.Trainer.User.LastName}";
+        var locationName = session.Location.Name;
+
+        var attendees = BuildAttendees(session);
+
+        var payload = new Dictionary<string, object?>
+        {
+            ["subject"] = SessionTitleBuilder.BuildOutlookSubject(session),
+            ["body"] = new
+            {
+                contentType = "HTML",
+                content = $"""
+                <p><strong>{(IsGroupClass(session) ? "Zapisani" : "Klient")}:</strong> {clientName}</p>
+                <p><strong>Trener:</strong> {trainerName}</p>
+                <p><strong>Lokalizacja:</strong> {locationName}</p>
+                <p><strong>Sala:</strong> {(IsGroupClass(session) ? "zarezerwowana na wyłączność" : "zarezerwowana")}</p>
+                <p><strong>Status:</strong> {session.Status}</p>
+                <p><strong>Notatka:</strong> {session.Note}</p>
+                """
+            },
+            ["start"] = new
+            {
+                dateTime = ToStudioLocalTime(session.StartAt).ToString("yyyy-MM-ddTHH:mm:ss"),
+                timeZone = OutlookStudioTimeZone
+            },
+            ["end"] = new
+            {
+                dateTime = ToStudioLocalTime(session.EndAt).ToString("yyyy-MM-ddTHH:mm:ss"),
+                timeZone = OutlookStudioTimeZone
+            },
+            ["location"] = new
+            {
+                displayName = locationName,
+                locationEmailAddress = session.Location.CalendarEmail
+            },
+            ["attendees"] = attendees,
+            ["showAs"] = "busy"
+        };
+
+        if (categories.Count > 0)
+            payload["categories"] = categories;
+
+        return payload;
+    }
+
+    private static DateTime ToStudioLocalTime(DateTime value)
+    {
+        if (value.Kind == DateTimeKind.Unspecified)
+            return value;
+
+        var utc = value.Kind == DateTimeKind.Utc
+            ? value
+            : value.ToUniversalTime();
+
+        return TimeZoneInfo.ConvertTimeFromUtc(utc, GetStudioTimeZone());
+    }
+
+    private static TimeZoneInfo GetStudioTimeZone()
+    {
+        foreach (var id in new[] { "Europe/Warsaw", OutlookStudioTimeZone })
+        {
+            try
+            {
+                return TimeZoneInfo.FindSystemTimeZoneById(id);
+            }
+            catch (TimeZoneNotFoundException)
+            {
+            }
+            catch (InvalidTimeZoneException)
+            {
+            }
+        }
+
+        return TimeZoneInfo.Utc;
+    }
+
+    private async Task PrepareRecipientsAsync(Session session)
+    {
+        if (!_settings.UseCalendarEmails) return;
+        foreach (var participant in session.Participants)
+            ClientCalendarAddress.Ensure(participant.Client, _settings.CalendarEmailDomain);
+        await _context.SaveChangesAsync();
+    }
+
+    private List<object> BuildAttendees(Session session)
+    {
+        var attendees = session.Participants
+            .Where(p => !string.IsNullOrWhiteSpace(ClientCalendarAddress.Recipient(p.Client, _settings)))
+            .OrderBy(p => p.Client.FirstName)
+            .ThenBy(p => p.Client.LastName)
+            .Select(p => new
+            {
+                emailAddress = new
+                {
+                    address = ClientCalendarAddress.Recipient(p.Client, _settings),
+                    name = $"{p.Client.FirstName} {p.Client.LastName}".Trim()
+                },
+                type = "required"
+            })
+            .Cast<object>()
+            .ToList();
+
+        if (!string.IsNullOrWhiteSpace(session.Location.CalendarEmail))
+        {
+            attendees.Add(new
+            {
+                emailAddress = new
+                {
+                    address = session.Location.CalendarEmail,
+                    name = session.Location.Name
+                },
+                type = "resource"
+            });
+        }
+
+        return attendees;
+    }
+
+    private async Task<CalendarIntegration?> GetTrainerIntegrationAsync(int userId)
+    {
+        return await _context.CalendarIntegrations
+            .FirstOrDefaultAsync(x =>
+                x.UserId == userId &&
+                x.Provider == "Outlook" &&
+                x.IsActive);
+    }
+
+    private async Task DeleteEventAsync(CalendarIntegration integration, string externalEventId)
+    {
+        await EnsureAccessTokenAsync(integration);
+
+        using var request = new HttpRequestMessage(
+            HttpMethod.Delete,
+            $"https://graph.microsoft.com/v1.0/me/events/{externalEventId}");
+
+        request.Headers.Authorization =
+            new AuthenticationHeaderValue("Bearer", integration.AccessToken);
+
+        var response = await _httpClient.SendAsync(request);
+
+        if (response.IsSuccessStatusCode ||
+            response.StatusCode is System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.Gone)
+            return;
+
+        var body = await response.Content.ReadAsStringAsync();
+        throw new InvalidOperationException($"Microsoft delete event error: {body}");
+    }
+
+    private async Task UpsertExternalCalendarEventAsync(
+        Session session,
+        int calendarIntegrationId,
+        string externalEventId,
+        string? seriesMasterId = null,
+        bool isRecurring = false)
+    {
+        var externalEvent = await _context.ExternalCalendarEvents
+            .FirstOrDefaultAsync(x =>
+                x.CalendarIntegrationId == calendarIntegrationId &&
+                x.ExternalEventId == externalEventId);
+
+        if (externalEvent is null)
+        {
+            externalEvent = new ExternalCalendarEvent
+            {
+                CalendarIntegrationId = calendarIntegrationId,
+                Provider = "Outlook",
+                ExternalEventId = externalEventId
+            };
+
+            await _context.ExternalCalendarEvents.AddAsync(externalEvent);
+        }
+
+        var categories = ResolveGraphEventCategories(session);
+        var categoryColors = ResolveGraphEventCategoryColors(session, categories);
+
+        externalEvent.Subject = session.Title;
+        externalEvent.BodyPreview = session.Note;
+        externalEvent.StartAt = session.StartAt;
+        externalEvent.EndAt = session.EndAt;
+        externalEvent.LocationName = session.Location.Name;
+        externalEvent.LocationEmail = session.Location.CalendarEmail;
+        externalEvent.AttendeesJson = JsonSerializer.Serialize(
+            session.Participants
+                .Select(p => ClientCalendarAddress.Recipient(p.Client, _settings))
+                .Where(e => !string.IsNullOrWhiteSpace(e))
+                .Distinct()
+                .ToList());
+        externalEvent.CategoriesJson = JsonSerializer.Serialize(categories);
+        externalEvent.CategoryColorsJson = JsonSerializer.Serialize(categoryColors);
+        externalEvent.SessionId = session.Id;
+        externalEvent.IsConvertedToSession = true;
+        externalEvent.SeriesMasterId = seriesMasterId;
+        externalEvent.IsRecurring = isRecurring;
+        externalEvent.ImportedAt = DateTime.UtcNow;
+
+        session.OutlookCategoryColorsJson = JsonSerializer.Serialize(categoryColors);
+    }
+
+    private async Task EnsureTrainerMasterCategoryAsync(
+        Session session,
+        string accessToken,
+        List<string> categories)
+    {
+        var trainerCategoryName = NormalizeCategoryName(session.Trainer.OutlookCategoryName);
+        var managedCategories = new List<(string Name, string Color)>();
+        if (IsGroupClass(session) && categories.Contains(
+                SessionTitleBuilder.GroupClassOutlookCategory,
+                StringComparer.OrdinalIgnoreCase))
+        {
+            managedCategories.Add((SessionTitleBuilder.GroupClassOutlookCategory, "preset0"));
+        }
+        if (ConsultationSessions.IsConsultation(session.PlannedSessionType) &&
+            categories.Contains(ConsultationSessions.OutlookCategory, StringComparer.OrdinalIgnoreCase))
+        {
+            managedCategories.Add((ConsultationSessions.OutlookCategory, ConsultationSessions.OutlookCategoryColor));
+        }
+        if (trainerCategoryName is not null &&
+            categories.Contains(trainerCategoryName, StringComparer.OrdinalIgnoreCase))
+        {
+            managedCategories.Add((trainerCategoryName, NormalizeCategoryColor(session.Trainer.OutlookCategoryColor)));
+        }
+
+        if (managedCategories.Count == 0)
+            return;
+
+        try
+        {
+            using var listRequest = new HttpRequestMessage(
+                HttpMethod.Get,
+                "https://graph.microsoft.com/v1.0/me/outlook/masterCategories?$select=displayName,color");
+
+            listRequest.Headers.Authorization =
+                new AuthenticationHeaderValue("Bearer", accessToken);
+
+            var listResponse = await _httpClient.SendAsync(listRequest);
+            var listBody = await listResponse.Content.ReadAsStringAsync();
+
+            if (!listResponse.IsSuccessStatusCode)
+            {
+                _logger.LogWarning(
+                    "Could not read Outlook master categories for trainer {TrainerId}: {Body}",
+                    session.TrainerId,
+                    listBody);
+
+                return;
+            }
+
+            using var doc = JsonDocument.Parse(listBody);
+
+            var existingNames = doc.RootElement.TryGetProperty("value", out var value) &&
+                value.ValueKind == JsonValueKind.Array
+                ? value.EnumerateArray()
+                    .Select(category => category.TryGetProperty("displayName", out var displayName)
+                        ? displayName.GetString()
+                        : null)
+                    .Where(name => !string.IsNullOrWhiteSpace(name))
+                    .Select(name => name!)
+                    .ToHashSet(StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var category in managedCategories.Where(category => !existingNames.Contains(category.Name)))
+                await CreateMasterCategoryAsync(accessToken, category.Name, category.Color);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex,
+                "Could not ensure Outlook master categories for trainer {TrainerId}.",
+                session.TrainerId);
+        }
+    }
+
+    private async Task CreateMasterCategoryAsync(
+        string accessToken,
+        string categoryName,
+        string color)
+    {
+        using var request = new HttpRequestMessage(
+            HttpMethod.Post,
+            "https://graph.microsoft.com/v1.0/me/outlook/masterCategories");
+
+        request.Headers.Authorization =
+            new AuthenticationHeaderValue("Bearer", accessToken);
+
+        request.Content = new StringContent(
+            JsonSerializer.Serialize(new
+            {
+                displayName = categoryName,
+                color
+            }),
+            Encoding.UTF8,
+            "application/json");
+
+        var response = await _httpClient.SendAsync(request);
+
+        if (response.IsSuccessStatusCode)
+            return;
+
+        var body = await response.Content.ReadAsStringAsync();
+
+        _logger.LogWarning(
+            "Could not create Outlook master category {CategoryName}: {Body}",
+            categoryName,
+            body);
+    }
+
+    private static List<string> ResolveGraphEventCategories(Session session)
+    {
+        var categories = new List<string>();
+        var trainerCategoryName = NormalizeCategoryName(session.Trainer.OutlookCategoryName);
+
+        if (IsGroupClass(session))
+            categories.Add(SessionTitleBuilder.GroupClassOutlookCategory);
+
+        if (trainerCategoryName is not null)
+            categories.Add(trainerCategoryName);
+
+        // After the trainer category, so the event keeps the trainer colour in Outlook and CRM.
+        if (ConsultationSessions.IsConsultation(session.PlannedSessionType))
+            categories.Add(ConsultationSessions.OutlookCategory);
+
+        categories.AddRange(ReadStringList(session.OutlookCategoriesJson));
+
+        return categories
+            .Select(NormalizeCategoryName)
+            .Where(c => c is not null)
+            .Select(c => c!)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    private static List<OutlookCategoryColor> ResolveGraphEventCategoryColors(
+        Session session,
+        List<string> categories)
+    {
+        return categories
+            .Select(category => new OutlookCategoryColor
+            {
+                Name = category,
+                Color = string.Equals(category, SessionTitleBuilder.GroupClassOutlookCategory, StringComparison.OrdinalIgnoreCase)
+                    ? "preset0"
+                    : string.Equals(category, ConsultationSessions.OutlookCategory, StringComparison.OrdinalIgnoreCase)
+                    ? ConsultationSessions.OutlookCategoryColor
+                    : string.Equals(category, session.Trainer.OutlookCategoryName, StringComparison.OrdinalIgnoreCase)
+                    ? NormalizeCategoryColor(session.Trainer.OutlookCategoryColor)
+                    : null
+            })
+            .ToList();
+    }
+
+    private static string? NormalizeCategoryName(string? value)
+    {
+        var normalized = value?.Trim();
+
+        return string.IsNullOrWhiteSpace(normalized)
+            ? null
+            : normalized;
+    }
+
+    private static string NormalizeCategoryColor(string? value)
+    {
+        var normalized = value?.Trim();
+
+        return string.IsNullOrWhiteSpace(normalized)
+            ? "preset7"
+            : normalized;
+    }
+
+    private static List<string> ReadStringList(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return new List<string>();
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<string>>(json) ?? new List<string>();
+        }
+        catch
+        {
+            return new List<string>();
+        }
+    }
+
+    private static bool IsGroupClass(Session session)
+    {
+        return session.IsPubliclyBookable ||
+            string.Equals(session.PlannedSessionType, "Group", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static DateTime ReadGraphDateTime(JsonElement value)
+    {
+        var raw = value.GetProperty("dateTime").GetString()
+            ?? throw new InvalidOperationException("Graph occurrence start is missing.");
+        if (raw.EndsWith("Z", StringComparison.OrdinalIgnoreCase) &&
+            DateTimeOffset.TryParse(raw, out var offset))
+        {
+            return offset.UtcDateTime;
+        }
+
+        if (!DateTime.TryParse(raw, out var parsed))
+            throw new InvalidOperationException("Graph occurrence start is invalid.");
+
+        var timeZone = value.TryGetProperty("timeZone", out var timeZoneElement)
+            ? timeZoneElement.GetString()
+            : null;
+        if (string.Equals(timeZone, "UTC", StringComparison.OrdinalIgnoreCase))
+            return DateTime.SpecifyKind(parsed, DateTimeKind.Utc);
+
+        return TimeZoneInfo.ConvertTimeToUtc(
+            DateTime.SpecifyKind(parsed, DateTimeKind.Unspecified),
+            GetStudioTimeZone());
+    }
+
+    private sealed class OutlookCategoryColor
+    {
+        public string Name { get; set; } = string.Empty;
+
+        public string? Color { get; set; }
+    }
+
+    private sealed class OutlookSeriesInstance
+    {
+        public string Id { get; set; } = string.Empty;
+
+        public DateTime StartAt { get; set; }
+    }
+
+    private async Task EnsureAccessTokenAsync(CalendarIntegration integration)
+    {
+        await OutlookInstanceBinding.EnsureAllowedAsync(_context, _settings.WebhookUrl);
+
+        if (integration.AccessTokenExpiresAt > DateTime.UtcNow.AddMinutes(2) &&
+            !string.IsNullOrWhiteSpace(integration.AccessToken))
+        {
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(integration.RefreshToken))
+            throw new InvalidOperationException("Outlook refresh token is missing.");
+
+        var tokenUrl =
+            $"https://login.microsoftonline.com/{_settings.TenantId}/oauth2/v2.0/token";
+
+        var form = new Dictionary<string, string>
+        {
+            ["client_id"] = _settings.ClientId,
+            ["client_secret"] = _settings.ClientSecret,
+            ["refresh_token"] = integration.RefreshToken,
+            ["grant_type"] = "refresh_token",
+            ["scope"] = _settings.Scopes
+        };
+
+        var response = await _httpClient.PostAsync(
+            tokenUrl,
+            new FormUrlEncodedContent(form));
+
+        var body = await response.Content.ReadAsStringAsync();
+
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException($"Microsoft refresh token error: {body}");
+
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+
+        integration.AccessToken =
+            root.GetProperty("access_token").GetString() ?? string.Empty;
+
+        if (string.IsNullOrWhiteSpace(integration.AccessToken))
+            throw new InvalidOperationException("Microsoft returned empty access token.");
+
+        if (root.TryGetProperty("refresh_token", out var refresh))
+        {
+            var newRefreshToken = refresh.GetString();
+
+            if (!string.IsNullOrWhiteSpace(newRefreshToken))
+                integration.RefreshToken = newRefreshToken;
+        }
+
+        integration.AccessTokenExpiresAt = DateTime.UtcNow.AddSeconds(
+            root.GetProperty("expires_in").GetInt32() - 60);
+
+        await _context.SaveChangesAsync();
+    }
+}

@@ -1,0 +1,83 @@
+using StudioCRM.Application.DTOs.Calendar;
+
+namespace StudioCRM.Application.DTOs.Sessions;
+
+public class SessionDto
+{
+    public string? EventRules { get; set; }
+    public StudioCRM.Application.DTOs.Sessions.BookingRulesDto BookingRules { get; set; } = new();
+    public bool IsGroupSession { get; set; }
+    public int? Capacity { get; set; }
+    public int BookedSeats { get; set; }
+    public int? AvailableSeats { get; set; }
+    public bool IsFullyBooked { get; set; }
+    public int Id { get; set; }
+
+    public string Title { get; set; } = string.Empty;
+
+    public string? Note { get; set; }
+
+    public DateTime StartAt { get; set; }
+
+    public DateTime EndAt { get; set; }
+
+    public int TrainerId { get; set; }
+
+    public string TrainerFullName { get; set; } = string.Empty;
+
+    public bool CanEdit { get; set; }
+
+    public int LocationId { get; set; }
+
+    public string LocationName { get; set; } = string.Empty;
+
+    public string Status { get; set; } = string.Empty;
+
+    public bool IsPubliclyBookable { get; set; }
+
+    public string? PublicSlug { get; set; }
+
+    public int? PublicCapacity { get; set; }
+
+    public int? PublicAvailableSpots { get; set; }
+
+    public string? PlannedSessionType { get; set; }
+
+    public string? ActualSessionType { get; set; }
+
+    public int? ActualParticipantsCount { get; set; }
+
+    public DateTime? CompletedAt { get; set; }
+
+    public int ParticipantsCount { get; set; }
+
+    public string ClientsDisplayName { get; set; } = string.Empty;
+
+    public List<SessionParticipantListDto> Participants { get; set; } = new();
+
+    public DateTime CreatedAt { get; set; }
+
+    public DateTime UpdatedAt { get; set; }
+
+    public int? CreatedBy { get; set; }
+
+    public int LocationParticipantsCount { get; set; }
+
+    public int LocationLimit { get; set; } = 8;
+
+    public bool IsLocationLimitExceeded { get; set; }
+
+    public List<string> OutlookCategories { get; set; } = new();
+
+    public List<OutlookCategoryDto> OutlookCategoryColors { get; set; } = new();
+
+    public string? PrimaryOutlookCategory { get; set; }
+
+    public string? PrimaryOutlookCategoryColor { get; set; }
+
+    public bool IsRecurring { get; set; }
+
+    public string? RecurringGroupId { get; set; }
+
+    public int? RecurrenceInstanceNumber { get; set; }
+}

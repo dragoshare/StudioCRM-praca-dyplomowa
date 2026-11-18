@@ -1,0 +1,158 @@
+using System.Linq.Expressions;
+using Microsoft.EntityFrameworkCore;
+using StudioCRM.Application.DTOs.Billing;
+using StudioCRM.Application.DTOs.TrainerPortal;
+using StudioCRM.Domain.Entities;
+using StudioCRM.Domain.Enums;
+using StudioCRM.Infrastructure.Persistence;
+namespace StudioCRM.Infrastructure.Services;
+
+public partial class TrainerPortalService
+{
+    public async Task<TrainerDashboardSummaryDto?> GetDashboardSummaryAsync()
+    {
+        var now = DateTime.UtcNow;
+        var localDate = TimeZoneInfo.ConvertTimeFromUtc(now, GetStudioTimeZone()).Date;
+        var today = TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(localDate, DateTimeKind.Unspecified), GetStudioTimeZone());
+        var tomorrow = TimeZoneInfo.ConvertTimeToUtc(DateTime.SpecifyKind(localDate.AddDays(1), DateTimeKind.Unspecified), GetStudioTimeZone());
+        var sessions = _context.Sessions.AsNoTracking().Where(s => s.Trainer.UserId == _currentUser.UserId && s.Status != "Cancelled");
+        var result = await _context.Trainers.Where(t => t.UserId == _currentUser.UserId)
+            .Select(t => new TrainerDashboardSummaryDto
+            {
+                ActiveClientsCount = _context.Clients.Count(c => c.TrainerId == t.Id && c.Status == "Active"),
+                TodaySessionsCount = _context.Sessions.Count(s => s.TrainerId == t.Id && s.Status != "Cancelled" && s.StartAt >= today && s.StartAt < tomorrow),
+                UpcomingSessionsCount = _context.Sessions.Count(s => s.TrainerId == t.Id && s.Status != "Cancelled" && s.StartAt >= now)
+            }).FirstOrDefaultAsync();
+        if (result == null) return null;
+        result.UpcomingSessions = await sessions.Where(s => s.StartAt >= now).OrderBy(s => s.StartAt).ThenBy(s => s.Id).Take(8)
+            .Select(s => new TrainerDashboardSessionDto { Id = s.Id, Title = s.Title, StartAt = s.StartAt, EndAt = s.EndAt,
+                Status = s.Status, LocationId = s.LocationId, LocationName = s.Location.Name, Capacity = s.PublicCapacity,
+                BookedSeats = s.Participants.Count(p => p.AttendanceStatus != "CancelledInTime" && p.AttendanceStatus != "CancelledLate") }).ToListAsync();
+        return result;
+    }
+
+    public async Task<PagedResultDto<TrainerPortalClientDto>> GetClientsPageAsync(PortalPageFilter filter)
+    {
+        filter.Validate();
+        var query = _context.Clients.AsNoTracking().Where(c => c.Trainer != null && c.Trainer.UserId == _currentUser.UserId);
+        if (filter.LocationId.HasValue) query = query.Where(c => c.LocationId == filter.LocationId);
+        if (!string.IsNullOrWhiteSpace(filter.Status)) query = query.Where(c => c.Status == filter.Status);
+        if (!string.IsNullOrWhiteSpace(filter.Search))
+        {
+            var term = filter.Search.Trim().ToLower();
+            query = query.Where(c => (c.FirstName + " " + c.LastName).ToLower().Contains(term) || c.Email.ToLower().Contains(term));
+        }
+        if (filter.HasActivePackage.HasValue) query = WhereHasActivePackage(_context, query, filter.HasActivePackage.Value);
+        if (filter.HasAmountDue == true) query = WhereHasAmountDue(_context, query);
+        var milestones = filter.HasPendingReward == true || filter.Sort.StartsWith("rewards")
+            ? await ClientMilestoneRewards.LoadThresholdsAsync(_context) : null;
+        if (filter.HasPendingReward == true) query = ClientMilestoneRewards.WhereHasPending(_context, query, milestones!);
+        var count = await query.CountAsync();
+        var ordered = OrderPortalClients(_context, query, filter.Sort, milestones);
+        var items = await ordered.Skip((filter.Page - 1) * filter.PageSize).Take(filter.PageSize)
+            .Select(c => new TrainerPortalClientDto
+            {
+                ClientId = c.Id,
+                TrainerId = c.TrainerId,
+                TrainerFullName = c.Trainer != null ? c.Trainer.User.FirstName + " " + c.Trainer.User.LastName : null,
+                LocationId = c.LocationId,
+                ActivePackageId = c.ActivePackageId,
+                UserId = c.UserId,
+                PortalAccessStatus = c.PortalAccessBlocked || (c.User != null && !c.User.IsActive) ? "Blocked" : c.UserId != null ? "Active" : _context.Invitations.Any(i => i.ClientId == c.Id && !i.IsAccepted && i.CancelledAt == null && i.ExpiresAt > DateTime.UtcNow) ? "Invited" : "NoAccount",
+                FullName = c.FirstName + " " + c.LastName,
+                Email = c.Email,
+                EmailContactUrl = c.Email == "" ? "" : "mailto:" + c.Email,
+                PhoneNumber = c.PhoneNumber,
+                PhoneContactUrl = c.PhoneNumber != null ? "tel:" + c.PhoneNumber : null,
+                AvatarUrl = c.User != null ? c.User.AvatarUrl : null,
+                Goal = c.Goal,
+                Status = c.Status,
+                BillingStatus = c.BillingStatus,
+                LocationName = c.Location.Name,
+                TrainingStartDate = c.TrainingStartDate,
+                CreatedAt = c.CreatedAt
+            })
+            .ToListAsync();
+        await EnrichPortalClientsAsync(items);
+        return ReadPage(items, count, filter);
+    }
+
+    public async Task<PagedResultDto<GroupClientOptionDto>> GetGroupClientsAsync(PortalPageFilter filter)
+    {
+        filter.Validate();
+        if (!filter.LocationId.HasValue) throw new InvalidOperationException("locationId is required.");
+        if (!_currentUser.IsOwner && !await _context.TrainerLocations.AnyAsync(t =>
+            t.Trainer.UserId == _currentUser.UserId && t.LocationId == filter.LocationId))
+            throw new KeyNotFoundException("Location not found.");
+        var query = _context.Clients.AsNoTracking().Where(c => c.LocationMemberships.Any(m =>
+            m.LocationId == filter.LocationId && m.GroupAccessEnabled));
+        if (!string.IsNullOrWhiteSpace(filter.Search))
+        {
+            var term = filter.Search.Trim().ToLower();
+            query = query.Where(c => (c.FirstName + " " + c.LastName).ToLower().Contains(term));
+        }
+        if (!string.IsNullOrWhiteSpace(filter.Status)) query = query.Where(c => c.Status == filter.Status);
+        var count = await query.CountAsync();
+        var items = await query.OrderBy(c => c.LastName).ThenBy(c => c.FirstName).ThenBy(c => c.Id)
+            .Skip((filter.Page - 1) * filter.PageSize).Take(filter.PageSize)
+            .Select(c => new GroupClientOptionDto { ClientId = c.Id, FullName = c.FirstName + " " + c.LastName }).ToListAsync();
+        return ReadPage(items, count, filter);
+    }
+
+    // Same set as ClientListSummaryReader.ActivePackages.
+    internal static IQueryable<Client> WhereHasActivePackage(StudioCRMDbContext db, IQueryable<Client> query, bool hasActive) =>
+        query.Where(c => db.ClientPackages.Any(p => p.ClientId == c.Id && p.IsActive && p.ClosureDisposition == null) == hasActive);
+
+    // Same set as ClientListSummaryReader TotalAmountDue > 0.
+    internal static IQueryable<Client> WhereHasAmountDue(StudioCRMDbContext db, IQueryable<Client> query) =>
+        query.Where(c => db.ClientPackages.Any(p => p.ClientId == c.Id && p.TotalPrice > p.AmountPaid));
+
+    // Balance, usage and amount due mirror ClientListSummaryReader: settlement balance without payment credit/reversal,
+    // and UsedSessions/TotalSessions of the personal/semi package shown in the flat ActivePackage* fields.
+    // Milestone sorts need the active definitions as thresholds (ClientMilestoneRewards.LoadThresholdsAsync).
+    internal static IOrderedQueryable<Client> OrderPortalClients(StudioCRMDbContext db, IQueryable<Client> query, string sort,
+        IReadOnlyList<MilestoneThreshold>? milestones = null)
+    {
+        Expression<Func<Client, decimal>> balance = c => db.ClientBalanceTransactions
+            .Where(t => t.ClientId == c.Id && t.Type != BalanceTransactionType.PaymentCredit && t.Type != BalanceTransactionType.PaymentReversal)
+            .Sum(t => (decimal?)t.Amount) ?? 0;
+        Expression<Func<Client, bool>> hasPersonal = c => db.ClientPackages.Any(p => p.ClientId == c.Id && p.IsActive &&
+            p.ClosureDisposition == null && p.BillingMode == PackageBillingMode.SessionBased && p.ExpectedBillingType != SessionBillingType.Group);
+        Expression<Func<Client, decimal?>> usage = c => db.ClientPackages
+            .Where(p => p.ClientId == c.Id && p.IsActive && p.ClosureDisposition == null &&
+                p.BillingMode == PackageBillingMode.SessionBased && p.ExpectedBillingType != SessionBillingType.Group)
+            .OrderByDescending(p => p.ActivatedAt ?? p.PurchaseDate).ThenByDescending(p => p.Id)
+            .Select(p => (decimal?)(p.TotalSessions > 0 ? (decimal)p.UsedSessions / p.TotalSessions : 0m))
+            .FirstOrDefault();
+        // Amount due = sum of max(0, TotalPrice - AmountPaid) over all the client's packages (TotalAmountDue).
+        Expression<Func<Client, decimal>> amountDue = c => db.ClientPackages
+            .Where(p => p.ClientId == c.Id && p.TotalPrice > p.AmountPaid)
+            .Sum(p => p.TotalPrice - p.AmountPaid);
+        var thresholds = milestones ?? [];
+        var pending = ClientMilestoneRewards.Pending(db, thresholds);
+        var claimed = ClientMilestoneRewards.Claimed(db);
+        return sort switch
+        {
+            "nameDesc" => query.OrderByDescending(c => c.LastName).ThenByDescending(c => c.FirstName).ThenBy(c => c.Id),
+            "created" => query.OrderBy(c => c.CreatedAt).ThenBy(c => c.Id),
+            "createdDesc" => query.OrderByDescending(c => c.CreatedAt).ThenByDescending(c => c.Id),
+            "balance" => query.OrderBy(balance).ThenBy(c => c.Id),
+            "balanceDesc" => query.OrderByDescending(balance).ThenBy(c => c.Id),
+            // Clients without a personal/semi package go last in both directions.
+            "packageUsage" => query.OrderByDescending(hasPersonal).ThenBy(usage).ThenBy(c => c.Id),
+            "packageUsageDesc" => query.OrderByDescending(hasPersonal).ThenByDescending(usage).ThenBy(c => c.Id),
+            "amountDue" => query.OrderBy(amountDue).ThenBy(c => c.Id),
+            "amountDueDesc" => query.OrderByDescending(amountDue).ThenByDescending(c => c.Id),
+            // Ties on pending: longer tenure first (it has waited longer for its milestones).
+            "rewardsPending" => query.OrderBy(pending).ThenByDescending(c => c.TrainingStartDate ?? c.CreatedAt).ThenBy(c => c.Id),
+            "rewardsPendingDesc" => query.OrderByDescending(pending).ThenBy(c => c.TrainingStartDate ?? c.CreatedAt).ThenBy(c => c.Id),
+            "rewardsClaimed" => query.OrderBy(claimed).ThenBy(pending).ThenBy(c => c.Id),
+            "rewardsClaimedDesc" => query.OrderByDescending(claimed).ThenByDescending(pending).ThenBy(c => c.Id),
+            _ => query.OrderBy(c => c.LastName).ThenBy(c => c.FirstName).ThenBy(c => c.Id)
+        };
+    }
+
+    private static PagedResultDto<T> ReadPage<T>(List<T> items, int total, PortalPageFilter filter) => new()
+    { Items = items, TotalCount = total, Page = filter.Page, PageSize = filter.PageSize,
+      TotalPages = (int)Math.Ceiling(total / (double)filter.PageSize) };
+}

@@ -1,0 +1,36 @@
+﻿using StudioCRM.Application.DTOs.Sessions;
+
+namespace StudioCRM.Application.Interfaces;
+
+public interface ISessionService
+{
+    Task<List<SessionDto>> GetAllAsync();
+
+    Task<List<SessionDto>> GetFilteredAsync(SessionFilterDto filter);
+    Task<StudioCRM.Application.DTOs.Billing.PagedResultDto<SessionDto>> GetFilteredPageAsync(SessionFilterDto filter);
+
+    Task<SessionDto?> GetByIdAsync(int id);
+
+    Task<SessionWorkspaceDto?> GetWorkspaceAsync(int id);
+
+    Task<List<SessionCorrectionDto>> GetCorrectionsAsync(int id);
+
+    Task<SessionDto> CreateAsync(CreateSessionDto request);
+
+    Task<SessionSeriesDto> CreateSeriesAsync(CreateSessionSeriesDto request);
+
+    Task<SessionSeriesOutlookSyncDto> SyncSeriesToOutlookAsync(
+        string recurringGroupId,
+        SessionRecurrenceDto? recurrence);
+
+    Task<DeleteSessionSeriesResultDto> DeleteSeriesAsync(string recurringGroupId);
+
+    Task<SessionDto?> UpdateAsync(int id, UpdateSessionDto request);
+
+    Task<bool> DeleteAsync(int id);
+
+    Task<bool> RestoreAsync(int id);
+
+    Task<List<SessionDto>> GetDeletedAsync();
+    Task CountSessionFromPackageAsync(CountSessionFromPackageRequest request);
+}

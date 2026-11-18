@@ -1,0 +1,98 @@
+using System.Net;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using StudioCRM.Application.Settings;
+using StudioCRM.Domain.Entities;
+using StudioCRM.Infrastructure.Services.Calendar;
+
+namespace StudioCRM.Tests.IntegrationTests;
+
+// Incident 21.10.2026: a test backend on a copy of the production database used the copied Outlook tokens and
+// subscriptions. The database is bound to one backend; any other one makes no Microsoft Graph call at all.
+public class OutlookInstanceBindingTests
+{
+    private const string Production = "https://api.studio.example.test/api/outlook/webhook";
+
+    [Fact]
+    public void FingerprintIdentifiesDatabaseAndBackend()
+    {
+        const string prod = "Host=db.example.test;Port=6543;Database=postgres;Username=postgres.prodref;Password=a";
+        const string copy = "Host=db.example.test;Port=6543;Database=postgres;Username=postgres.testref;Password=a";
+        var bound = OutlookInstanceBinding.Fingerprint(prod, Production);
+
+        // Same database and backend: password, letter case and a trailing slash do not matter.
+        Assert.Equal(bound, OutlookInstanceBinding.Fingerprint(prod.Replace("Password=a", "Password=b").ToUpperInvariant(), Production + "/"));
+        // A copy in another Supabase project, even with the production webhook URL copied into its settings.
+        Assert.NotEqual(bound, OutlookInstanceBinding.Fingerprint(copy, Production));
+        // Another backend on the same database.
+        Assert.NotEqual(bound, OutlookInstanceBinding.Fingerprint(prod, "https://api-test.studio.example.test/api/outlook/webhook"));
+    }
+
+    [PostgresFact]
+    public async Task FirstBackendClaimsTheDatabaseAndAnotherOneCallsNoGraph()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        await using var db = database.Context();
+        var user = new User { Email = "binding-trainer@test.invalid" };
+        var integration = new CalendarIntegration
+        {
+            User = user, Provider = "Outlook", IsActive = true, Email = user.Email,
+            AccessToken = "valid", RefreshToken = "refresh", AccessTokenExpiresAt = DateTime.UtcNow.AddHours(1)
+        };
+        db.Add(integration);
+        await db.SaveChangesAsync();
+
+        var handler = new CountingHandler();
+        OutlookTokenService Tokens(string webhookUrl) =>
+            new(db, Options.Create(new OutlookSettings { WebhookUrl = webhookUrl, TenantId = "common" }), new HttpClient(handler));
+
+        // Production claims the database; a valid token needs no refresh.
+        await Tokens(Production).EnsureValidAccessTokenAsync(integration);
+        Assert.True(await OutlookInstanceBinding.IsAllowedAsync(db, Production));
+        Assert.Equal(OutlookInstanceBinding.Fingerprint(db.Database.GetConnectionString(), Production),
+            await db.SystemSettings.Where(s => s.Key == OutlookInstanceBinding.SettingKey).Select(s => s.Value).SingleAsync());
+
+        // Another backend: refused even with a still valid access token and even for a forced refresh.
+        const string other = "https://api-test.studio.example.test/api/outlook/webhook";
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(() => Tokens(other).EnsureValidAccessTokenAsync(integration, forceRefresh: true));
+        Assert.Equal(OutlookInstanceBinding.BlockedMessage, error.Message);
+        Assert.False(await OutlookInstanceBinding.IsAllowedAsync(db, other));
+        Assert.Equal(0, handler.Calls);
+
+        // Deliberate move: removing the binding lets the next backend claim it.
+        await db.SystemSettings.Where(s => s.Key == OutlookInstanceBinding.SettingKey).ExecuteDeleteAsync();
+        OutlookInstanceBinding.ClearCache();
+        Assert.True(await OutlookInstanceBinding.IsAllowedAsync(db, other));
+        Assert.False(await OutlookInstanceBinding.IsAllowedAsync(db, Production));
+    }
+
+    [PostgresFact]
+    public async Task OtherOrganizationCannotReuseCachedLegacyBindingOrClaimItsOwn()
+    {
+        await using var database = await TestDatabase.CreateAsync();
+        await using var legacy = database.Context();
+        Assert.True(await OutlookInstanceBinding.IsAllowedAsync(legacy, Production));
+        var profile = new OrganizationBrandingProfile { Id = Guid.NewGuid(), Name = "Demo" };
+        var org = new Organization { Id = Guid.NewGuid(), Name = "Demo", Slug = "binding-demo", Status = "Active", BrandingProfileId = profile.Id };
+        legacy.AddRange(profile, org); await legacy.SaveChangesAsync();
+        await using var other = database.Context(organizationId: org.Id);
+        Assert.False(await OutlookInstanceBinding.IsAllowedAsync(other, Production));
+        Assert.Empty(await other.SystemSettings.ToListAsync());
+        var handler = new CountingHandler();
+        var tokens = new OutlookTokenService(other, Options.Create(new OutlookSettings { WebhookUrl = Production }), new HttpClient(handler));
+        await Assert.ThrowsAsync<InvalidOperationException>(() => tokens.EnsureValidAccessTokenAsync(new CalendarIntegration
+        { IsActive = true, AccessToken = "valid", RefreshToken = "refresh", AccessTokenExpiresAt = DateTime.UtcNow.AddHours(1) }, true));
+        Assert.Equal(0, handler.Calls);
+        Assert.Single(await legacy.SystemSettings.Where(s => s.Key == OutlookInstanceBinding.SettingKey).ToListAsync());
+    }
+    private sealed class CountingHandler : HttpMessageHandler
+    {
+        public int Calls;
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Interlocked.Increment(ref Calls);
+            return Task.FromResult(new HttpResponseMessage(HttpStatusCode.BadRequest));
+        }
+    }
+}

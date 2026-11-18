@@ -1,0 +1,2231 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using System.Text.Json;
+using StudioCRM.Application.DTOs.Calendar;
+using StudioCRM.Application.DTOs.SessionParticipants;
+using StudioCRM.Application.DTOs.Sessions;
+using StudioCRM.Application.Interfaces;
+using StudioCRM.Application.Interfaces.Calendar;
+using StudioCRM.Domain.Entities;
+using StudioCRM.Domain.Enums;
+using StudioCRM.Infrastructure.Persistence;
+using StudioCRM.Application.Common;
+using StudioCRM.Application.Settings;
+using Microsoft.Extensions.Options;
+namespace StudioCRM.Infrastructure.Services;
+
+public class SessionService : ISessionService
+{
+    private const int LocationPeopleLimit = 8;
+    private const int TrainerConcurrentParticipantLimit = 4;
+    private const int DefaultSeriesOccurrencesCount = 12;
+    private const int MaxSeriesOccurrencesCount = 104;
+    private const string OutlookStudioTimeZone = "Central European Standard Time";
+
+    private readonly StudioCRMDbContext _context;
+    private readonly ICurrentUserService _currentUser;
+    private readonly ISubscriptionService _subscriptionService;
+    private readonly ISessionParticipantService _sessionParticipantService;
+    private readonly IOutlookCalendarSyncService _outlookCalendarSyncService;
+    private readonly IStudioSettingsService _settingsService;
+    private readonly ILogger<SessionService> _logger;
+
+    private readonly SessionBalanceSettings _balanceSettings;
+
+    public SessionService(
+        StudioCRMDbContext context,
+        ICurrentUserService currentUser,
+        ISubscriptionService subscriptionService,
+        ISessionParticipantService sessionParticipantService,
+        IOutlookCalendarSyncService outlookCalendarSyncService,
+        IStudioSettingsService settingsService,
+        ILogger<SessionService> logger,
+        IOptions<SessionBalanceSettings>? balanceSettings = null)
+    {
+        _balanceSettings = balanceSettings?.Value ?? new SessionBalanceSettings();
+        _context = context;
+        _currentUser = currentUser;
+        _subscriptionService = subscriptionService;
+        _sessionParticipantService = sessionParticipantService;
+        _outlookCalendarSyncService = outlookCalendarSyncService;
+        _settingsService = settingsService;
+        _logger = logger;
+    }
+
+    public async Task<List<SessionDto>> GetAllAsync()
+    {
+        var query = await ApplySessionVisibilityAsync(BaseQuery());
+
+        var sessions = await query
+            .OrderBy(s => s.StartAt)
+            .ToListAsync();
+
+        return await MapSessionDtosAsync(sessions);
+    }
+
+    public async Task<SessionDto?> GetByIdAsync(int id)
+    {
+        var query = await ApplySessionVisibilityAsync(BaseQuery());
+
+        var session = await query
+            .FirstOrDefaultAsync(s => s.Id == id);
+
+        if (session is null)
+            return null;
+
+        return await MapSessionDtoAsync(session);
+    }
+
+    public async Task<List<SessionCorrectionDto>> GetCorrectionsAsync(int id)
+    {
+        var corrections = await _context.SessionCorrections
+            .AsNoTracking()
+            .Where(x => x.OriginalSessionId == id)
+            .OrderByDescending(x => x.CreatedAt)
+            .ToListAsync();
+        var authorIds = corrections.Where(x => x.ChangedByUserId.HasValue).Select(x => x.ChangedByUserId!.Value).Distinct().ToList();
+        var authors = await _context.Users.AsNoTracking().Where(u => authorIds.Contains(u.Id))
+            .ToDictionaryAsync(u => u.Id, u => $"{u.FirstName} {u.LastName}".Trim());
+
+        return corrections.Select(x => new SessionCorrectionDto
+        {
+            Id = x.Id,
+            SessionId = x.SessionId,
+            OriginalSessionId = x.OriginalSessionId,
+            ChangeType = x.ChangeType,
+            Reason = x.Reason,
+            BeforeState = JsonSerializer.Deserialize<JsonElement>(x.BeforeStateJson),
+            AfterState = JsonSerializer.Deserialize<JsonElement>(x.AfterStateJson),
+            ChangedByUserId = x.ChangedByUserId,
+            ChangedByFullName = x.ChangedByUserId.HasValue ? authors.GetValueOrDefault(x.ChangedByUserId.Value) : null,
+            CreatedAt = x.CreatedAt
+        }).ToList();
+    }
+
+    public async Task<SessionWorkspaceDto?> GetWorkspaceAsync(int id)
+    {
+        var session = await GetByIdAsync(id);
+
+        if (session is null)
+            return null;
+
+        var link = await _context.CalendarEventLinks
+            .FirstOrDefaultAsync(x =>
+                x.SessionId == id &&
+                x.Provider == "Outlook");
+
+        var externalEvent = link is null
+            ? null
+            : await _context.ExternalCalendarEvents
+                .FirstOrDefaultAsync(x =>
+                    x.Provider == link.Provider &&
+                    x.ExternalEventId == link.ExternalEventId);
+
+        var isLockedByPaidSettlement = await IsSessionLockedByPaidSettlementAsync(
+            session.TrainerId,
+            session.StartAt);
+
+        return new SessionWorkspaceDto
+        {
+            Session = session,
+            OutlookSync = new SessionOutlookSyncDto
+            {
+                IsSynced = link is not null,
+                Provider = link?.Provider,
+                ExternalEventId = link?.ExternalEventId,
+                LastSyncedAt = link?.SyncedAt,
+                Warnings = ReadStringList(externalEvent?.MappingWarningsJson)
+            },
+            QuickActions = new SessionWorkspaceQuickActionsDto
+            {
+                CanEditParticipants = session.CanEdit && !isLockedByPaidSettlement,
+                CanComplete = session.CanEdit && !isLockedByPaidSettlement && session.Status != "Cancelled"
+            }
+        };
+    }
+
+    public Task<SessionDto> CreateAsync(CreateSessionDto request)
+    {
+        return CreateAsync(request, recurringGroupId: null, recurrenceInstanceNumber: null, syncToOutlook: true);
+    }
+
+    private async Task<SessionDto> CreateAsync(
+        CreateSessionDto request,
+        string? recurringGroupId,
+        int? recurrenceInstanceNumber,
+        bool syncToOutlook)
+    {
+        var participants = request.Participants ?? new List<CreateSessionParticipantDto>();
+        request.Participants = participants;
+        var normalizedStartAt = NormalizeStudioDateTime(request.StartAt);
+        var normalizedEndAt = await ResolveCreateSessionEndAtAsync(request.EndAt, normalizedStartAt);
+        var requestedStatus = string.IsNullOrWhiteSpace(request.Status)
+            ? "Planned"
+            : request.Status;
+
+        if (requestedStatus == "Completed")
+        {
+            await EnsureSessionIsNotLockedByPaidSettlementAsync(request.TrainerId, normalizedStartAt);
+        }
+
+        await ValidateSessionRequestAsync(
+            request.TrainerId,
+            request.LocationId,
+            normalizedStartAt,
+            normalizedEndAt,
+            request.IsPubliclyBookable,
+            request.PublicCapacity,
+            request.PlannedSessionType,
+            participants,
+            excludedSessionId: null);
+
+        var clients = await GetClientsForParticipantsAsync(participants);
+        var outlookCategories = await ResolveOutlookCategoriesForTrainerAsync(
+            request.TrainerId,
+            request.OutlookCategories,
+            request.IsPubliclyBookable || IsGroupSessionType(request.PlannedSessionType),
+            ConsultationSessions.IsConsultation(request.PlannedSessionType));
+        var outlookCategoryColors = await ResolveOutlookCategoryColorsForTrainerAsync(
+            request.TrainerId,
+            outlookCategories,
+            request.IsPubliclyBookable || IsGroupSessionType(request.PlannedSessionType));
+
+        var title = ResolveSessionTitle(
+            request.Title,
+            clients,
+            request.IsPubliclyBookable,
+            request.PlannedSessionType);
+
+        var transaction = requestedStatus == "Completed"
+            ? await _context.Database.BeginTransactionAsync()
+            : null;
+        var transactionCommitted = false;
+
+        try
+        {
+            var session = new Session
+            {
+                Title = title,
+                Note = request.Note,
+                StartAt = normalizedStartAt,
+                EndAt = normalizedEndAt,
+                TrainerId = request.TrainerId,
+                LocationId = request.LocationId,
+                StudioRoom = null,
+                Status = requestedStatus,
+                IsPubliclyBookable = request.IsPubliclyBookable,
+                PublicSlug = NormalizePublicSlug(request.PublicSlug),
+                EventRules = request.EventRules?.Trim(),
+                RegistrationClosesBeforeMinutes = GroupBookingPolicy.ValidateMinutes(request.RegistrationClosesBeforeMinutes),
+                CancellationClosesBeforeMinutes = GroupBookingPolicy.ValidateMinutes(request.CancellationClosesBeforeMinutes),
+                PublicCapacity = NormalizePublicCapacity(request.IsPubliclyBookable, request.PublicCapacity),
+                PlannedSessionType = request.IsPubliclyBookable ? "Group" : request.PlannedSessionType ?? ResolveSessionType(participants.Count),
+                OutlookCategoriesJson = SerializeOutlookCategories(outlookCategories),
+                OutlookCategoryColorsJson = SerializeOutlookCategoryColors(outlookCategoryColors),
+                PrimaryOutlookCategory = GetPrimaryOutlookCategory(outlookCategories),
+                IsRecurring = recurringGroupId is not null,
+                RecurringGroupId = recurringGroupId,
+                RecurrenceInstanceNumber = recurrenceInstanceNumber,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow,
+                CreatedBy = _currentUser.UserId
+            };
+
+            await _context.Sessions.AddAsync(session);
+            await _context.SaveChangesAsync();
+
+            await AddParticipantsToSessionAsync(
+                session.Id,
+                participants,
+                clients,
+                GroupBookingPolicy.IsGroup(session) ? "Group" : session.PlannedSessionType,
+                session.LocationId);
+
+            if (requestedStatus == "Completed")
+            {
+                var completionRequest = BuildCompletionRequest(request);
+                var completed = await _sessionParticipantService.CompleteSessionAsync(session.Id, completionRequest);
+
+                if (!completed)
+                    throw new InvalidOperationException("Created session could not be completed.");
+
+                if (transaction is not null)
+                {
+                    await transaction.CommitAsync();
+                    transactionCommitted = true;
+                    if (syncToOutlook)
+                        await TrySyncSessionToOutlookAsync(session.Id);
+                }
+            }
+            else if (requestedStatus != "Cancelled" && syncToOutlook)
+            {
+                await TrySyncSessionToOutlookAsync(session.Id);
+            }
+
+            return await GetByIdAsync(session.Id)
+                ?? throw new InvalidOperationException("Created session could not be loaded.");
+        }
+        catch
+        {
+            if (transaction is not null && !transactionCommitted)
+                await transaction.RollbackAsync();
+
+            throw;
+        }
+        finally
+        {
+            if (transaction is not null)
+                await transaction.DisposeAsync();
+        }
+    }
+
+    public async Task<SessionDto?> UpdateAsync(int id, UpdateSessionDto request)
+    {
+        await using var transaction = _context.Database.CurrentTransaction == null ? await _context.Database.BeginTransactionAsync() : null;
+        try
+        {
+            await SessionWriteLock.AcquireAsync(_context, id, request.Participants?.Select(p => p.ClientId));
+            var result = await UpdateCoreAsync(id, request);
+            if (transaction != null) await transaction.CommitAsync();
+            return result;
+        }
+        catch
+        {
+            if (transaction != null) { await transaction.RollbackAsync(); _context.ChangeTracker.Clear(); }
+            throw;
+        }
+    }
+
+    private async Task<SessionDto?> UpdateCoreAsync(int id, UpdateSessionDto request)
+    {
+        var normalizedStartAt = NormalizeStudioDateTime(request.StartAt);
+        var normalizedEndAt = NormalizeStudioDateTime(request.EndAt);
+
+        var session = await _context.Sessions
+            .Include(s => s.Participants)
+            .FirstOrDefaultAsync(s => s.Id == id);
+
+        if (session is null)
+            return null;
+
+        var previousStatus = session.Status;
+        var previousStartAt = session.StartAt;
+        var previousEndAt = session.EndAt;
+
+        var replaceParticipants = request.Participants is not null;
+        var participants = request.Participants ?? session.Participants
+            .Select(p => new CreateSessionParticipantDto
+            {
+                ClientId = p.ClientId,
+                CountsAgainstPackage = p.CountsAgainstPackage,
+                SessionsCharged = p.SessionsCharged,
+                Note = p.Note
+            })
+            .ToList();
+
+        request.Participants = participants;
+
+        var requestedStatus = string.IsNullOrWhiteSpace(request.Status)
+            ? "Planned"
+            : request.Status;
+
+        var currentHasPackageAccounting = session.Participants.Any(p => p.IsCountedFromPackage);
+
+        var locksCurrentSettlement =
+            session.Status == "Completed" ||
+            currentHasPackageAccounting;
+
+        var locksTargetSettlement = requestedStatus == "Completed";
+
+        if (locksCurrentSettlement)
+        {
+            await EnsureSessionIsNotLockedByPaidSettlementAsync(session.TrainerId, session.StartAt);
+        }
+
+        if (locksTargetSettlement)
+        {
+            await EnsureSessionIsNotLockedByPaidSettlementAsync(request.TrainerId, normalizedStartAt);
+        }
+
+        await ValidateSessionRequestAsync(
+            request.TrainerId,
+            request.LocationId,
+            normalizedStartAt,
+            normalizedEndAt,
+            request.IsPubliclyBookable,
+            request.PublicCapacity,
+            request.PlannedSessionType,
+            participants,
+            excludedSessionId: id);
+
+        var clients = await GetClientsForParticipantsAsync(participants);
+        var outlookCategories = await ResolveOutlookCategoriesForTrainerAsync(
+            request.TrainerId,
+            request.OutlookCategories,
+            request.IsPubliclyBookable || IsGroupSessionType(request.PlannedSessionType),
+            ConsultationSessions.IsConsultation(request.PlannedSessionType));
+        var outlookCategoryColors = await ResolveOutlookCategoryColorsForTrainerAsync(
+            request.TrainerId,
+            outlookCategories,
+            request.IsPubliclyBookable || IsGroupSessionType(request.PlannedSessionType));
+
+        var transaction = _context.Database.CurrentTransaction == null && (locksCurrentSettlement || locksTargetSettlement)
+            ? await _context.Database.BeginTransactionAsync()
+            : null;
+        var transactionCommitted = false;
+
+        try
+        {
+            var correctionBefore = locksCurrentSettlement
+                ? await SessionCorrectionRecorder.CaptureAsync(_context, session.Id)
+                : null;
+
+            session.Title = ResolveSessionTitle(
+                request.Title,
+                clients,
+                request.IsPubliclyBookable,
+                request.PlannedSessionType,
+                session.Title);
+
+            session.Note = request.Note;
+            session.StartAt = normalizedStartAt;
+            session.EndAt = normalizedEndAt;
+            session.TrainerId = request.TrainerId;
+            session.LocationId = request.LocationId;
+            session.StudioRoom = null;
+            session.Status = requestedStatus;
+            session.IsPubliclyBookable = request.IsPubliclyBookable;
+            session.PublicSlug = NormalizePublicSlug(request.PublicSlug);
+            session.EventRules = request.EventRules is null ? session.EventRules : request.EventRules.Trim();
+            session.RegistrationClosesBeforeMinutes = GroupBookingPolicy.ValidateMinutes(request.RegistrationClosesBeforeMinutes ?? session.RegistrationClosesBeforeMinutes);
+            session.CancellationClosesBeforeMinutes = GroupBookingPolicy.ValidateMinutes(request.CancellationClosesBeforeMinutes ?? session.CancellationClosesBeforeMinutes);
+            session.PublicCapacity = NormalizePublicCapacity(request.IsPubliclyBookable, request.PublicCapacity);
+            session.PlannedSessionType = request.IsPubliclyBookable ? "Group" : request.PlannedSessionType ?? ResolveSessionType(participants.Count);
+            session.OutlookCategoriesJson = SerializeOutlookCategories(outlookCategories);
+            session.OutlookCategoryColorsJson = SerializeOutlookCategoryColors(outlookCategoryColors);
+            session.PrimaryOutlookCategory = GetPrimaryOutlookCategory(outlookCategories);
+            session.UpdatedAt = DateTime.UtcNow;
+
+            if (currentHasPackageAccounting && requestedStatus == "Completed")
+            {
+                if (replaceParticipants)
+                    EnsureCompletedSessionParticipantsWereNotChanged(session, participants);
+
+                await _context.SaveChangesAsync();
+
+                if (correctionBefore is not null)
+                {
+                    await SessionCorrectionRecorder.RecordAsync(
+                        _context,
+                        session.Id,
+                        "CompletedSessionUpdated",
+                        request.CorrectionReason,
+                        correctionBefore,
+                        _currentUser.UserId);
+                    await _context.SaveChangesAsync();
+                }
+
+                await TrySyncSessionToOutlookAsync(session.Id);
+
+                if (transaction is not null)
+                {
+                    await transaction.CommitAsync();
+                    transactionCommitted = true;
+                }
+
+                return await GetByIdAsync(session.Id);
+            }
+
+            if (locksCurrentSettlement)
+            {
+                await RevertSessionPackageAccountingAsync(session);
+                session.ActualSessionType = null;
+                session.ActualParticipantsCount = null;
+                session.CompletedAt = null;
+            }
+
+            if (replaceParticipants)
+            {
+                _context.SessionParticipants.RemoveRange(session.Participants);
+
+                await _context.SaveChangesAsync();
+
+                await AddParticipantsToSessionAsync(
+                    session.Id,
+                    participants,
+                    clients,
+                    GroupBookingPolicy.IsGroup(session) ? "Group" : session.PlannedSessionType,
+                    session.LocationId);
+            }
+            else if (requestedStatus != "Completed")
+            {
+                await _context.SaveChangesAsync();
+            }
+
+            if (requestedStatus == "Completed")
+            {
+                var completionRequest = BuildCompletionRequest(request);
+                var completed = await _sessionParticipantService.CompleteSessionAsync(session.Id, completionRequest);
+
+                if (!completed)
+                    throw new InvalidOperationException("Updated session could not be completed.");
+
+                if (transaction is not null)
+                {
+                    await transaction.CommitAsync();
+                    transactionCommitted = true;
+                    await TrySyncSessionToOutlookAsync(session.Id);
+                }
+            }
+            else if (IsGroupClass(session) && requestedStatus == "Cancelled" && previousStatus != "Cancelled")
+            {
+                await QueueGroupClassChangeNotificationsAsync(
+                    session,
+                    "GroupClassCancelled",
+                    "Zajęcia grupowe zostały odwołane",
+                    $"{session.Title}. Wykorzystane wejście wróciło do pakietu.",
+                    $"group-session:{session.Id}:cancelled:{session.UpdatedAt.Ticks}");
+                await _context.SaveChangesAsync();
+            }
+            else if (IsGroupClass(session) && requestedStatus == "Planned" &&
+                (previousStartAt != session.StartAt || previousEndAt != session.EndAt))
+            {
+                await QueueGroupClassChangeNotificationsAsync(
+                    session,
+                    "GroupClassRescheduled",
+                    "Zmieniono termin zajęć grupowych",
+                    $"Nowy termin: {ToStudioDisplayDateTime(session.StartAt):dd.MM.yyyy HH:mm}.",
+                    $"group-session:{session.Id}:rescheduled:{session.UpdatedAt.Ticks}");
+                await _context.SaveChangesAsync();
+            }
+
+            if (correctionBefore is not null && requestedStatus != "Completed")
+            {
+                await _context.SaveChangesAsync();
+                await SessionCorrectionRecorder.RecordAsync(
+                    _context,
+                    session.Id,
+                    "SessionStatusCorrected",
+                    request.CorrectionReason,
+                    correctionBefore,
+                    _currentUser.UserId);
+                await _context.SaveChangesAsync();
+            }
+
+            if (requestedStatus == "Cancelled")
+            {
+                await TryDeleteSessionFromOutlookAsync(session.Id);
+            }
+            else if (requestedStatus != "Completed")
+            {
+                await TrySyncSessionToOutlookAsync(session.Id);
+            }
+
+            if (transaction is not null && !transactionCommitted)
+            {
+                await transaction.CommitAsync();
+                transactionCommitted = true;
+            }
+
+            return await GetByIdAsync(session.Id);
+        }
+        catch
+        {
+            if (transaction is not null && !transactionCommitted)
+                await transaction.RollbackAsync();
+
+            throw;
+        }
+        finally
+        {
+            if (transaction is not null)
+                await transaction.DisposeAsync();
+        }
+    }
+
+    public async Task<bool> DeleteAsync(int id)
+    {
+        await using var transaction = _context.Database.CurrentTransaction == null ? await _context.Database.BeginTransactionAsync() : null;
+        try
+        {
+            await SessionWriteLock.AcquireAsync(_context, id);
+            var result = await DeleteCoreAsync(id);
+            if (transaction != null) await transaction.CommitAsync();
+            return result;
+        }
+        catch
+        {
+            if (transaction != null) { await transaction.RollbackAsync(); _context.ChangeTracker.Clear(); }
+            throw;
+        }
+    }
+
+    private async Task<bool> DeleteCoreAsync(int id)
+    {
+        var session = await _context.Sessions.FirstOrDefaultAsync(s => s.Id == id);
+
+        if (session is null)
+            return false;
+
+        var touchesCompletedSession =
+            session.Status == "Completed" ||
+            await _context.SessionParticipants.AnyAsync(p =>
+                p.SessionId == session.Id &&
+                p.IsCountedFromPackage);
+
+        await using var transaction = _context.Database.CurrentTransaction == null && touchesCompletedSession
+            ? await _context.Database.BeginTransactionAsync()
+            : null;
+
+        try
+        {
+            if (touchesCompletedSession)
+            {
+                await EnsureSessionIsNotLockedByPaidSettlementAsync(session.TrainerId, session.StartAt);
+                await RevertSessionPackageAccountingAsync(session);
+            }
+
+            if (IsGroupClass(session))
+            {
+                await QueueGroupClassChangeNotificationsAsync(
+                    session,
+                    "GroupClassCancelled",
+                    "Zajęcia grupowe zostały odwołane",
+                    $"{session.Title}. Wykorzystane wejście wróciło do pakietu.",
+                    $"group-session:{session.Id}:deleted:{DateTime.UtcNow.Ticks}");
+            }
+
+            await TryDeleteSessionFromOutlookAsync(session.Id);
+
+            _context.Sessions.Remove(session);
+            await _context.SaveChangesAsync();
+
+            if (transaction is not null)
+                await transaction.CommitAsync();
+
+            return true;
+        }
+        catch
+        {
+            if (transaction is not null)
+                await transaction.RollbackAsync();
+            throw;
+        }
+    }
+
+    private static bool IsGroupClass(Session session)
+    {
+        return session.IsPubliclyBookable ||
+            string.Equals(
+                session.PlannedSessionType,
+                nameof(SessionBillingType.Group),
+                StringComparison.OrdinalIgnoreCase);
+    }
+
+    private async Task QueueGroupClassChangeNotificationsAsync(
+        Session session,
+        string type,
+        string title,
+        string message,
+        string sourceKey)
+    {
+        var clientUserIds = await _context.SessionParticipants
+            .Where(x =>
+                x.SessionId == session.Id &&
+                x.AttendanceStatus != "CancelledInTime" &&
+                x.AttendanceStatus != "CancelledLate" &&
+                x.Client.UserId.HasValue)
+            .Select(x => x.Client.UserId!.Value)
+            .Distinct()
+            .ToListAsync();
+
+        await NotificationWriter.QueueAsync(
+            _context,
+            clientUserIds,
+            sourceKey,
+            type,
+            title,
+            message,
+            type == "GroupClassCancelled" ? "Warning" : "Info",
+            "session",
+            session.Id,
+            $"/group-classes?sessionId={session.Id}");
+
+        var trainerUserId = await _context.Trainers
+            .Where(x => x.Id == session.TrainerId)
+            .Select(x => x.UserId)
+            .FirstOrDefaultAsync();
+
+        if (trainerUserId != 0)
+        {
+            await NotificationWriter.QueueAsync(
+                _context,
+                new[] { trainerUserId },
+                sourceKey,
+                type,
+                title,
+                message,
+                type == "GroupClassCancelled" ? "Warning" : "Info",
+                "session",
+                session.Id,
+                $"/sessions/{session.Id}/workspace");
+        }
+    }
+
+    public async Task<SessionSeriesDto> CreateSeriesAsync(CreateSessionSeriesDto request)
+    {
+        if (request.Session is null || request.Recurrence is null)
+            throw new InvalidOperationException("Session and recurrence settings are required.");
+
+        var status = string.IsNullOrWhiteSpace(request.Session.Status)
+            ? "Planned"
+            : request.Session.Status.Trim();
+        if (!string.Equals(status, "Planned", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("A new session series must start with Planned status.");
+
+        var baseStartAt = NormalizeStudioDateTime(request.Session.StartAt);
+        var baseEndAt = await ResolveCreateSessionEndAtAsync(request.Session.EndAt, baseStartAt);
+        var duration = baseEndAt - baseStartAt;
+        var occurrenceStarts = BuildSeriesOccurrenceStarts(request.Session.StartAt, request.Recurrence);
+        var recurringGroupId = Guid.NewGuid().ToString("N");
+        var occurrenceRequests = occurrenceStarts
+            .Select((startAt, index) => CloneSeriesOccurrenceRequest(
+                request.Session,
+                startAt,
+                startAt.Add(duration),
+                index + 1))
+            .ToList();
+
+        // Validate the complete plan before writing the first occurrence.
+        foreach (var occurrence in occurrenceRequests)
+        {
+            await ValidateSessionRequestAsync(
+                occurrence.TrainerId,
+                occurrence.LocationId,
+                NormalizeStudioDateTime(occurrence.StartAt),
+                NormalizeStudioDateTime(occurrence.EndAt!.Value),
+                occurrence.IsPubliclyBookable,
+                occurrence.PublicCapacity,
+                occurrence.PlannedSessionType,
+                occurrence.Participants,
+                excludedSessionId: null);
+        }
+
+        var createdSessions = new List<SessionDto>();
+        var databaseStopwatch = System.Diagnostics.Stopwatch.StartNew();
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        try
+        {
+            for (var index = 0; index < occurrenceRequests.Count; index++)
+            {
+                createdSessions.Add(await CreateAsync(
+                    occurrenceRequests[index],
+                    recurringGroupId,
+                    index + 1,
+                    syncToOutlook: false));
+            }
+
+            await transaction.CommitAsync();
+        }
+        catch
+        {
+            await transaction.RollbackAsync();
+            throw;
+        }
+
+        _logger.LogInformation("Series {SeriesId}: {Count} sessions saved in {ElapsedMs} ms.",
+            recurringGroupId, createdSessions.Count, databaseStopwatch.ElapsedMilliseconds);
+        var outlookSync = await TrySyncSessionSeriesToOutlookAsync(recurringGroupId, request.Recurrence);
+
+        if (!outlookSync.IsSynced && _context.OrganizationId == StudioCRMDbContext.LegacyOrganizationId)
+        {
+            await RemoveFailedNewSeriesAsync(recurringGroupId);
+            throw new InvalidOperationException(
+                $"Session series was not created because Outlook synchronization failed: {outlookSync.Warning}");
+        }
+
+        return new SessionSeriesDto
+        {
+            RecurringGroupId = recurringGroupId,
+            Frequency = NormalizeSeriesFrequency(request.Recurrence.Frequency),
+            Interval = request.Recurrence.Interval,
+            OccurrencesCount = createdSessions.Count,
+            OutlookSeriesSynced = outlookSync.IsSynced,
+            OutlookSyncWarning = outlookSync.Warning,
+            Sessions = createdSessions
+        };
+    }
+
+    private async Task RemoveFailedNewSeriesAsync(string recurringGroupId)
+    {
+        var sessions = await _context.Sessions
+            .Where(session =>
+                session.RecurringGroupId == recurringGroupId &&
+                session.IsRecurring)
+            .ToListAsync();
+
+        if (sessions.Count == 0)
+            return;
+
+        _context.Sessions.RemoveRange(sessions);
+        await _context.SaveChangesAsync();
+    }
+
+    public async Task<SessionSeriesOutlookSyncDto> SyncSeriesToOutlookAsync(
+        string recurringGroupId,
+        SessionRecurrenceDto? recurrence)
+    {
+        if (string.IsNullOrWhiteSpace(recurringGroupId))
+            throw new InvalidOperationException("Recurring group id is required.");
+
+        var seriesSessions = await _context.Sessions
+            .Where(session => session.RecurringGroupId == recurringGroupId && session.IsRecurring)
+            .OrderBy(session => session.StartAt)
+            .Select(session => session.StartAt)
+            .ToListAsync();
+        if (seriesSessions.Count < 2)
+            throw new InvalidOperationException("Session series does not exist.");
+
+        recurrence ??= InferSeriesRecurrence(seriesSessions);
+        var outlookSync = await TrySyncSessionSeriesToOutlookAsync(recurringGroupId, recurrence);
+        return new SessionSeriesOutlookSyncDto
+        {
+            RecurringGroupId = recurringGroupId,
+            OutlookSeriesSynced = outlookSync.IsSynced,
+            OutlookSyncWarning = outlookSync.Warning
+        };
+    }
+
+    private static SessionRecurrenceDto InferSeriesRecurrence(List<DateTime> occurrenceStarts)
+    {
+        var localDates = occurrenceStarts
+            .Select(value => ToStudioDisplayDateTime(value).Date)
+            .Distinct()
+            .OrderBy(value => value)
+            .ToList();
+        var gaps = localDates
+            .Zip(localDates.Skip(1), (previous, next) => (next - previous).Days)
+            .ToList();
+
+        if (gaps.Count > 0 && gaps.All(gap => gap == gaps[0]) && gaps[0] is >= 1 and <= 12)
+        {
+            return new SessionRecurrenceDto
+            {
+                Frequency = "Daily",
+                Interval = gaps[0],
+                OccurrencesCount = occurrenceStarts.Count
+            };
+        }
+
+        var weekAnchors = localDates
+            .Select(date => date.AddDays(-((7 + (int)date.DayOfWeek - (int)DayOfWeek.Monday) % 7)))
+            .Distinct()
+            .OrderBy(value => value)
+            .ToList();
+        var weekGaps = weekAnchors
+            .Zip(weekAnchors.Skip(1), (previous, next) => Math.Max(1, (next - previous).Days / 7))
+            .ToList();
+        var interval = weekGaps.Count == 0
+            ? 1
+            : weekGaps.Aggregate(GreatestCommonDivisor);
+
+        return new SessionRecurrenceDto
+        {
+            Frequency = "Weekly",
+            Interval = Math.Clamp(interval, 1, 12),
+            DaysOfWeek = localDates
+                .Select(value => value.DayOfWeek.ToString())
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToList(),
+            OccurrencesCount = occurrenceStarts.Count
+        };
+    }
+
+    private static int GreatestCommonDivisor(int left, int right)
+    {
+        while (right != 0)
+        {
+            var remainder = left % right;
+            left = right;
+            right = remainder;
+        }
+
+        return Math.Abs(left);
+    }
+
+    public async Task<DeleteSessionSeriesResultDto> DeleteSeriesAsync(string recurringGroupId)
+    {
+        if (string.IsNullOrWhiteSpace(recurringGroupId))
+            throw new InvalidOperationException("Recurring group id is required.");
+
+        var sessions = await _context.Sessions
+            .Include(session => session.Participants)
+            .Where(session => session.RecurringGroupId == recurringGroupId && session.IsRecurring)
+            .OrderBy(session => session.RecurrenceInstanceNumber)
+            .ToListAsync();
+        if (sessions.Count == 0)
+            throw new InvalidOperationException("Session series does not exist.");
+
+        if (sessions.Any(session =>
+                string.Equals(session.Status, "Completed", StringComparison.OrdinalIgnoreCase) ||
+                session.Participants.Any(participant => participant.IsCountedFromPackage)))
+        {
+            throw new InvalidOperationException(
+                "A series containing completed or accounted sessions cannot be deleted as a whole.");
+        }
+
+        var outlookDeleted = _context.OrganizationId != StudioCRMDbContext.LegacyOrganizationId || await _outlookCalendarSyncService.DeleteSessionSeriesAsync(recurringGroupId);
+
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        try
+        {
+            _context.Sessions.RemoveRange(sessions);
+            await _context.SaveChangesAsync();
+            await transaction.CommitAsync();
+        }
+        catch
+        {
+            await transaction.RollbackAsync();
+            throw;
+        }
+
+        return new DeleteSessionSeriesResultDto
+        {
+            RecurringGroupId = recurringGroupId,
+            DeletedSessionsCount = sessions.Count,
+            OutlookSeriesDeleted = outlookDeleted
+        };
+    }
+
+    public async Task<bool> RestoreAsync(int id)
+    {
+        var session = await _context.Sessions
+            .IncludingOrganizationArchive(_context.OrganizationId)
+            .FirstOrDefaultAsync(s => s.Id == id);
+
+        if (session is null)
+            return false;
+
+        session.Status = "Planned";
+        session.UpdatedAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync();
+
+        await TrySyncSessionToOutlookAsync(session.Id);
+
+        return true;
+    }
+
+    public async Task<List<SessionDto>> GetDeletedAsync()
+    {
+        var sessions = await BaseQuery(includeDeleted: true)
+            .IncludingOrganizationArchive(_context.OrganizationId)
+            .Where(s => s.Status == "Deleted")
+            .OrderByDescending(s => s.UpdatedAt)
+            .ToListAsync();
+
+        return await MapSessionDtosAsync(sessions);
+    }
+
+    public async Task<List<SessionDto>> GetFilteredAsync(SessionFilterDto filter)
+    {
+        var sessions = await (await BuildFilteredQueryAsync(filter))
+            .OrderBy(s => s.StartAt)
+            .ToListAsync();
+
+        return await MapSessionDtosAsync(sessions);
+    }
+
+    public async Task<StudioCRM.Application.DTOs.Billing.PagedResultDto<SessionDto>> GetFilteredPageAsync(SessionFilterDto filter)
+    {
+        var page = filter.Page ?? 1;
+        var pageSize = filter.PageSize ?? 25;
+        if (page < 1 || page > 100000 || pageSize < 1 || pageSize > 100)
+            throw new InvalidOperationException("Page must be 1..100000 and PageSize 1..100.");
+        if (filter.Order is not null && filter.Order != "asc" && filter.Order != "desc")
+            throw new InvalidOperationException("Order must be asc or desc.");
+
+        var query = await BuildFilteredQueryAsync(filter);
+        var totalCount = await query.CountAsync();
+        var ordered = filter.Order == "asc"
+            ? query.OrderBy(s => s.StartAt).ThenBy(s => s.Id)
+            : query.OrderByDescending(s => s.StartAt).ThenByDescending(s => s.Id);
+        var sessions = await ordered.Skip((page - 1) * pageSize).Take(pageSize).ToListAsync();
+
+        return new StudioCRM.Application.DTOs.Billing.PagedResultDto<SessionDto>
+        {
+            Page = page,
+            PageSize = pageSize,
+            TotalCount = totalCount,
+            TotalPages = totalCount == 0 ? 0 : (int)Math.Ceiling(totalCount / (decimal)pageSize),
+            Items = await MapSessionDtosAsync(sessions)
+        };
+    }
+
+    private async Task<IQueryable<Session>> BuildFilteredQueryAsync(SessionFilterDto filter)
+    {
+        var query = await ApplySessionVisibilityAsync(BaseQuery());
+
+        if (filter.TrainerId.HasValue)
+            query = query.Where(s => s.TrainerId == filter.TrainerId.Value);
+
+        if (filter.ClientId.HasValue)
+            query = query.Where(s => s.Participants.Any(p => p.ClientId == filter.ClientId.Value));
+
+        if (filter.LocationId.HasValue)
+            query = query.Where(s => s.LocationId == filter.LocationId.Value);
+
+        if (!string.IsNullOrWhiteSpace(filter.Status))
+            query = query.Where(s => s.Status == filter.Status);
+
+        if (filter.From.HasValue)
+        {
+            var from = NormalizeStudioDateTime(filter.From.Value);
+            query = query.Where(s => s.StartAt >= from);
+        }
+
+        if (filter.To.HasValue)
+        {
+            var to = NormalizeStudioDateTime(filter.To.Value);
+            query = query.Where(s => s.StartAt <= to);
+        }
+
+        return query;
+    }
+
+    public async Task CountSessionFromPackageAsync(CountSessionFromPackageRequest request)
+    {
+        var sessionId = await _context.SessionParticipants.Where(p => p.Id == request.SessionParticipantId).Select(p => (int?)p.SessionId).SingleOrDefaultAsync();
+        if (!sessionId.HasValue) throw new InvalidOperationException("Session participant not found.");
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        try
+        {
+            await SessionWriteLock.AcquireAsync(_context, sessionId.Value);
+            await CountSessionFromPackageCoreAsync(request);
+            await transaction.CommitAsync();
+        }
+        catch { await transaction.RollbackAsync(); _context.ChangeTracker.Clear(); throw; }
+    }
+
+    private async Task CountSessionFromPackageCoreAsync(CountSessionFromPackageRequest request)
+    {
+        var participant = await _context.SessionParticipants
+            .Include(p => p.Session)
+            .FirstOrDefaultAsync(p => p.Id == request.SessionParticipantId);
+
+        if (participant is null)
+            throw new InvalidOperationException("Session participant not found.");
+
+        await EnsureCurrentUserCanManageSessionAsync(participant.Session);
+
+        await EnsureSessionIsNotLockedByPaidSettlementAsync(
+            participant.Session.TrainerId,
+            participant.Session.StartAt);
+
+        var clientPackage = await _context.ClientPackages
+            .FirstOrDefaultAsync(p => p.Id == request.ClientPackageId);
+
+        if (clientPackage is null)
+            throw new InvalidOperationException("Client package not found.");
+
+        if (clientPackage.BillingMode != PackageBillingMode.SessionBased)
+            throw new InvalidOperationException("Period packages do not include training entries.");
+        if (participant.ClientId != clientPackage.ClientId)
+            throw new InvalidOperationException("This package does not belong to this client.");
+
+        var isGroup = GroupBookingPolicy.IsGroup(participant.Session);
+        if (!Enum.IsDefined(request.ActualBillingType) ||
+            isGroup != (request.ActualBillingType == SessionBillingType.Group) ||
+            isGroup != (clientPackage.ExpectedBillingType == SessionBillingType.Group))
+            throw new InvalidOperationException("Group and personal packages must be accounted separately.");
+        if (isGroup && clientPackage.LocationId.HasValue && clientPackage.LocationId != participant.Session.LocationId)
+            throw new InvalidOperationException("Package is not valid at this session location.");
+        if (clientPackage.ClosureDisposition != null)
+            throw new InvalidOperationException("Closed package cannot be used.");
+
+        if (clientPackage.ValidUntil.HasValue && clientPackage.ValidUntil.Value < participant.Session.StartAt)
+            throw new InvalidOperationException("Package expired before this session. Owner must decide whether to extend or replace it.");
+        if (isGroup && clientPackage.PaymentStatus != PaymentStatus.Paid)
+            throw new InvalidOperationException("Group package must be paid before use.");
+        if (!clientPackage.IsActive)
+            throw new InvalidOperationException("Client package is not active.");
+
+        var usedSessions = await _context.SessionParticipants
+            .Where(p =>
+                p.ClientPackageId == clientPackage.Id &&
+                p.IsCountedFromPackage)
+            .SumAsync(p => p.SessionsCharged);
+
+        var isAlreadyCountedThisParticipant =
+            participant.ClientPackageId == clientPackage.Id &&
+            participant.IsCountedFromPackage;
+
+        var previousCharged = isAlreadyCountedThisParticipant ? Math.Max(0, participant.SessionsCharged) : 0;
+        var sessionsCharged = 1;
+        // The stored counter also holds opening entries of an imported running package, so never rebuild it from participants alone.
+        var storedUsedSessions = clientPackage.UsedSessions - previousCharged;
+        var newUsedSessions = Math.Max(usedSessions - previousCharged, storedUsedSessions) + sessionsCharged;
+        await AgreedPackageAccounting.ValidateAsync(
+            _context, clientPackage, request.ActualBillingType, participant.SessionId, sessionsCharged);
+
+        if (newUsedSessions > clientPackage.TotalSessions)
+            throw new InvalidOperationException("Client package has no remaining sessions.");
+
+        var expectedUnitPrice = clientPackage.ExpectedUnitPrice;
+        var balanceDifference = SessionBalancePolicy.PerSession(clientPackage, request.ActualBillingType,
+            _balanceSettings.OneToOneLevel(clientPackage.LocationId ?? participant.Session.LocationId));
+        var actualUnitPrice = expectedUnitPrice - balanceDifference;
+        if (request.ActualUnitPrice.HasValue && request.ActualUnitPrice.Value != actualUnitPrice)
+            throw new InvalidOperationException("Session price must follow the fixed training-type adjustment.");
+
+        participant.ClientPackageId = clientPackage.Id;
+        participant.CountsAgainstPackage = true;
+        participant.SessionsCharged = sessionsCharged;
+        participant.PackageId = clientPackage.PackageId;
+
+        participant.PlannedBillingType = clientPackage.ExpectedBillingType;
+        participant.ActualBillingType = request.ActualBillingType;
+        participant.ExpectedUnitPrice = expectedUnitPrice;
+        participant.ActualUnitPrice = actualUnitPrice;
+        participant.BalanceDifference = balanceDifference;
+        participant.IsCountedFromPackage = true;
+
+        participant.UpdatedAt = DateTime.UtcNow;
+
+        participant.Session.ActualSessionType = request.ActualBillingType.ToString();
+        participant.Session.ActualParticipantsCount = await _context.SessionParticipants
+            .CountAsync(p => p.SessionId == participant.SessionId);
+        participant.Session.Status = "Completed";
+        participant.Session.CompletedAt ??= DateTime.UtcNow;
+        participant.Session.UpdatedAt = DateTime.UtcNow;
+
+        var existingTransaction = await _context.ClientBalanceTransactions
+            .FirstOrDefaultAsync(t =>
+                t.ClientPackageId == clientPackage.Id &&
+                t.SessionId == participant.SessionId &&
+                t.ClientId == clientPackage.ClientId &&
+                t.Type == BalanceTransactionType.PackageAdjustment);
+
+        if (existingTransaction is not null)
+        {
+            _context.ClientBalanceTransactions.Remove(existingTransaction);
+        }
+
+        if (balanceDifference != 0)
+        {
+            var transaction = new ClientBalanceTransaction
+            {
+                ClientId = clientPackage.ClientId,
+                ClientPackageId = clientPackage.Id,
+                SessionId = participant.SessionId,
+                Amount = balanceDifference,
+                Type = BalanceTransactionType.PackageAdjustment,
+                Description = balanceDifference > 0
+                    ? $"Nadpłata: sesja rozliczona taniej niż pakiet ({request.ActualBillingType} zamiast {clientPackage.ExpectedBillingType})."
+                    : $"Dopłata: sesja rozliczona drożej niż pakiet ({request.ActualBillingType} zamiast {clientPackage.ExpectedBillingType}).",
+                CreatedAt = DateTime.UtcNow
+            };
+
+            await _context.ClientBalanceTransactions.AddAsync(transaction);
+        }
+
+        clientPackage.UsedSessions = newUsedSessions;
+
+        if (clientPackage.UsedSessions >= clientPackage.TotalSessions)
+            await _subscriptionService.RenewAfterCompletedCycleAsync(clientPackage.Id);
+
+        await _context.SaveChangesAsync();
+    }
+
+    private async Task EnsureSessionIsNotLockedByPaidSettlementAsync(int trainerId, DateTime startAt)
+    {
+        if (await IsSessionLockedByPaidSettlementAsync(trainerId, startAt))
+        {
+            throw new CodedInvalidOperationException(SessionCorrectionErrorCodes.TrainerSettlementPaid,
+                "Session cannot be changed because the trainer settlement for this month has already been paid.");
+        }
+    }
+
+    private async Task EnsureCurrentUserCanManageSessionAsync(Session session)
+    {
+        if (_currentUser.IsOwner)
+            return;
+
+        if (!_currentUser.IsTrainer || !_currentUser.UserId.HasValue)
+            throw new InvalidOperationException("Current user cannot manage this session.");
+
+        var ownsSession = await _context.Trainers
+            .AnyAsync(t => t.Id == session.TrainerId && t.UserId == _currentUser.UserId.Value);
+
+        if (!ownsSession)
+            throw new InvalidOperationException("Trainer can manage only their own sessions.");
+    }
+
+    private async Task<bool> IsSessionLockedByPaidSettlementAsync(int trainerId, DateTime startAt)
+    {
+        var (year, month) = GetStudioYearMonth(startAt);
+
+        return await _context.TrainerMonthlySettlements.AnyAsync(s =>
+            s.TrainerId == trainerId &&
+            s.Year == year &&
+            s.Month == month &&
+            s.IsPaid);
+    }
+
+    private async Task RevertSessionPackageAccountingAsync(Session session)
+    {
+        await SessionAccountingCorrectionManager.RevertAsync(_context, session);
+    }
+
+    private static void EnsureCompletedSessionParticipantsWereNotChanged(
+        Session session,
+        List<CreateSessionParticipantDto> requestedParticipants)
+    {
+        var existingClientIds = session.Participants
+            .Select(p => p.ClientId)
+            .OrderBy(id => id)
+            .ToList();
+
+        var requestedClientIds = requestedParticipants
+            .Select(p => p.ClientId)
+            .OrderBy(id => id)
+            .ToList();
+
+        if (!existingClientIds.SequenceEqual(requestedClientIds))
+        {
+            throw new InvalidOperationException(
+                "Use session completion to change participants or package accounting for a completed session.");
+        }
+    }
+
+    private IQueryable<Session> BaseQuery(bool includeDeleted = false)
+    {
+        return _context.Sessions.IncludingOrganizationArchive(_context.OrganizationId).Where(s => includeDeleted || !s.IsDeleted)
+            .Include(s => s.Trainer)
+                .ThenInclude(t => t.User)
+            .Include(s => s.Location)
+            .Include(s => s.Participants)
+                .ThenInclude(p => p.Client)
+            .Include(s => s.Participants)
+                .ThenInclude(p => p.Package)
+            .Include(s => s.Participants)
+                .ThenInclude(p => p.ClientPackage);
+    }
+
+    private async Task<IQueryable<Session>> ApplySessionVisibilityAsync(IQueryable<Session> query)
+    {
+        if (_currentUser.IsOwner)
+            return query;
+
+        if (!_currentUser.IsTrainer || !_currentUser.UserId.HasValue)
+            return query.Where(s => false);
+
+        var locationIds = await _context.TrainerLocations
+            .Where(tl => tl.Trainer.UserId == _currentUser.UserId.Value)
+            .Select(tl => tl.LocationId)
+            .ToListAsync();
+
+        return locationIds.Count == 0
+            ? query.Where(s => false)
+            : query.Where(s => locationIds.Contains(s.LocationId));
+    }
+
+    private async Task ValidateSessionRequestAsync(
+        int trainerId,
+        int locationId,
+        DateTime startAt,
+        DateTime endAt,
+        bool isPubliclyBookable,
+        int? publicCapacity,
+        string? plannedSessionType,
+        List<CreateSessionParticipantDto> participants,
+        int? excludedSessionId)
+    {
+        if (isPubliclyBookable && _context.OrganizationId != StudioCRMDbContext.LegacyOrganizationId)
+            throw new InvalidOperationException("Public booking is not enabled for this organization yet.");
+        if (endAt <= startAt)
+            throw new InvalidOperationException("End date must be later than start date.");
+
+        var trainerExists = await _context.Trainers.AnyAsync(t => t.Id == trainerId);
+        if (!trainerExists)
+            throw new InvalidOperationException("Trainer does not exist.");
+
+        var locationExists = await _context.Locations.AnyAsync(l => l.Id == locationId);
+        if (!locationExists)
+            throw new InvalidOperationException("Location does not exist.");
+
+        participants ??= new List<CreateSessionParticipantDto>();
+
+        var isGroupSession = isPubliclyBookable || IsGroupSessionType(plannedSessionType);
+        var normalizedPublicCapacity = NormalizePublicCapacity(isPubliclyBookable, publicCapacity);
+
+        var isConsultation = ConsultationSessions.IsConsultation(plannedSessionType);
+        if (isConsultation && (isPubliclyBookable || participants.Any()))
+            throw new InvalidOperationException("A consultation has no participants and cannot be publicly bookable.");
+
+        if (!isGroupSession && !isConsultation && !participants.Any())
+            throw new InvalidOperationException("At least one participant is required.");
+
+        var clientIds = participants.Select(p => p.ClientId).ToList();
+        var distinctClientIds = clientIds.Distinct().ToList();
+
+        if (clientIds.Count != distinctClientIds.Count)
+            throw new InvalidOperationException("Duplicated clients in session participants.");
+
+        if (isGroupSession && normalizedPublicCapacity.HasValue && distinctClientIds.Count > normalizedPublicCapacity.Value)
+            throw new InvalidOperationException("Group session participants count cannot exceed public capacity.");
+
+        if (!isGroupSession && distinctClientIds.Count > TrainerConcurrentParticipantLimit)
+            throw new InvalidOperationException("A trainer can run a session for at most four participants.");
+
+        var duplicateSlotSession = await _context.Sessions
+            .Where(s =>
+                s.TrainerId == trainerId &&
+                s.Status != "Cancelled" &&
+                s.StartAt == startAt &&
+                s.EndAt == endAt &&
+                (!excludedSessionId.HasValue || s.Id != excludedSessionId.Value))
+            .OrderBy(s => s.StartAt)
+            .Select(s => new
+            {
+                s.Id,
+                s.StartAt,
+                s.EndAt
+            })
+            .FirstOrDefaultAsync();
+
+        if (duplicateSlotSession is not null)
+        {
+            var start = ToStudioDisplayDateTime(duplicateSlotSession.StartAt);
+            var end = ToStudioDisplayDateTime(duplicateSlotSession.EndAt);
+
+            throw new InvalidOperationException(
+                $"Trainer already has a session in this exact time slot ({start:yyyy-MM-dd HH:mm}-{end:HH:mm}, session #{duplicateSlotSession.Id}). Add participants to the existing session instead of creating another one.");
+        }
+
+        var roomBlockingSession = await _context.Sessions
+            .Where(s =>
+                !s.IsDeleted &&
+                s.Status != "Cancelled" &&
+                s.LocationId == locationId &&
+                s.StartAt < endAt &&
+                s.EndAt > startAt &&
+                (!excludedSessionId.HasValue || s.Id != excludedSessionId.Value) &&
+                (isGroupSession || s.IsPubliclyBookable ||
+                    s.PlannedSessionType != null && s.PlannedSessionType.ToLower() == "group"))
+            .OrderBy(s => s.StartAt)
+            .Select(s => new { s.Id, s.Title, s.StartAt, s.EndAt })
+            .FirstOrDefaultAsync();
+
+        if (roomBlockingSession is not null)
+        {
+            var start = ToStudioDisplayDateTime(roomBlockingSession.StartAt);
+            var end = ToStudioDisplayDateTime(roomBlockingSession.EndAt);
+            throw new InvalidOperationException(
+                $"The studio room is not available because of session '{roomBlockingSession.Title}' " +
+                $"({start:yyyy-MM-dd HH:mm}-{end:HH:mm}, session #{roomBlockingSession.Id}).");
+        }
+
+        if (!isGroupSession)
+        {
+            await EnsureTrainerConcurrentParticipantLimitAsync(
+                trainerId,
+                startAt,
+                endAt,
+                distinctClientIds.Count,
+                excludedSessionId);
+        }
+    }
+
+    private async Task EnsureTrainerConcurrentParticipantLimitAsync(
+        int trainerId,
+        DateTime startAt,
+        DateTime endAt,
+        int requestedParticipantsCount,
+        int? excludedSessionId)
+    {
+        var overlappingSessions = await _context.Sessions
+            .Where(s =>
+                !s.IsDeleted &&
+                s.TrainerId == trainerId &&
+                s.Status != "Cancelled" &&
+                s.StartAt < endAt &&
+                s.EndAt > startAt &&
+                (!excludedSessionId.HasValue || s.Id != excludedSessionId.Value))
+            .Select(s => new TrainerCapacityInterval
+            {
+                SessionId = s.Id,
+                StartAt = s.StartAt,
+                EndAt = s.EndAt,
+                ParticipantsCount = s.Participants.Count
+            })
+            .ToListAsync();
+
+        if (overlappingSessions.Count == 0)
+            return;
+
+        var intervals = overlappingSessions
+            .Append(new TrainerCapacityInterval
+            {
+                SessionId = null,
+                StartAt = startAt,
+                EndAt = endAt,
+                ParticipantsCount = requestedParticipantsCount
+            })
+            .ToList();
+
+        var checkpoints = intervals
+            .SelectMany(i => new[] { i.StartAt, i.EndAt })
+            .Where(point => point >= startAt && point < endAt)
+            .Append(startAt)
+            .Distinct()
+            .OrderBy(point => point)
+            .ToList();
+
+        foreach (var checkpoint in checkpoints)
+        {
+            var activeIntervals = intervals
+                .Where(i => i.StartAt <= checkpoint && i.EndAt > checkpoint)
+                .ToList();
+
+            var participantsCount = activeIntervals.Sum(i => i.ParticipantsCount);
+
+            if (participantsCount <= TrainerConcurrentParticipantLimit)
+                continue;
+
+            var conflictingSessionIds = activeIntervals
+                .Where(i => i.SessionId.HasValue)
+                .Select(i => i.SessionId!.Value)
+                .OrderBy(id => id)
+                .ToList();
+
+            var conflictTime = ToStudioDisplayDateTime(checkpoint);
+            var conflictDescription = conflictingSessionIds.Count == 0
+                ? string.Empty
+                : $" Conflicting sessions: {string.Join(", ", conflictingSessionIds)}.";
+
+            throw new InvalidOperationException(
+                $"Trainer would have {participantsCount} participants at {conflictTime:yyyy-MM-dd HH:mm}. A trainer can run sessions for at most {TrainerConcurrentParticipantLimit} participants at the same time.{conflictDescription}");
+        }
+    }
+
+    private async Task<List<Client>> GetClientsForParticipantsAsync(List<CreateSessionParticipantDto> participants)
+    {
+        var clientIds = participants.Select(p => p.ClientId).Distinct().ToList();
+
+        var clients = await _context.Clients
+            .Where(c => clientIds.Contains(c.Id))
+            .ToListAsync();
+
+        if (clients.Count != clientIds.Count)
+            throw new InvalidOperationException("One or more clients do not exist.");
+
+        return participants
+            .Select(p => clients.First(c => c.Id == p.ClientId))
+            .ToList();
+    }
+
+    private async Task AddParticipantsToSessionAsync(
+        int sessionId,
+        List<CreateSessionParticipantDto> participants,
+        List<Client> clients,
+        string? plannedSessionType,
+        int sessionLocationId)
+    {
+        var bookingSession = await _context.Sessions.SingleAsync(s => s.Id == sessionId);
+        await SessionWriteLock.AcquireAsync(_context, sessionId, clients.Select(c => c.Id).ToArray());
+        foreach (var participantRequest in participants)
+        {
+            var client = clients.First(c => c.Id == participantRequest.ClientId);
+            var activeClientPackage = await PackageBookingEligibility.ResolveAsync(_context, client.Id, bookingSession, NormalizeSessionsCharged(participantRequest.SessionsCharged));
+            if (GroupBookingPolicy.IsGroup(bookingSession) && activeClientPackage == null)
+                throw new InvalidOperationException("A paid, valid group package with an available entry is required. Use the payment preparation flow.");
+            var sessionsCharged = NormalizeSessionsCharged(participantRequest.SessionsCharged);
+
+            var participant = new SessionParticipant
+            {
+                SessionId = sessionId,
+                ClientId = client.Id,
+                PackageId = activeClientPackage?.PackageId,
+                ClientPackageId = activeClientPackage?.Id,
+                AttendanceStatus = "Planned",
+                CountsAgainstPackage = GroupBookingPolicy.IsGroup(bookingSession) || participantRequest.CountsAgainstPackage,
+                SessionsCharged = sessionsCharged,
+                PlannedBillingType = activeClientPackage?.ExpectedBillingType,
+                ExpectedUnitPrice = activeClientPackage?.ExpectedUnitPrice,
+                Note = participantRequest.Note,
+                CreatedAt = DateTime.UtcNow,
+                UpdatedAt = DateTime.UtcNow
+            };
+
+            await _context.SessionParticipants.AddAsync(participant);
+        }
+
+        await _context.SaveChangesAsync();
+    }
+
+    private static CompleteSessionDto BuildCompletionRequest(CreateSessionDto request)
+    {
+        if (ConsultationSessions.IsConsultation(request.PlannedSessionType))
+            return new CompleteSessionDto { ActualSessionType = ConsultationSessions.SessionType };
+
+        var actualSessionType = ResolveActualSessionTypeForCompletion(request);
+
+        return new CompleteSessionDto
+        {
+            ActualSessionType = actualSessionType.ToString(),
+            Participants = request.Participants!
+                .Select(p => new CompleteSessionParticipantDto
+                {
+                    ClientId = p.ClientId,
+                    AttendanceStatus = "Present",
+                    CountsAgainstPackage = p.CountsAgainstPackage,
+                    SessionsCharged = NormalizeSessionsCharged(p.SessionsCharged),
+                    Note = p.Note
+                })
+                .ToList()
+        };
+    }
+
+    private async Task<DateTime> ResolveCreateSessionEndAtAsync(DateTime? endAt, DateTime normalizedStartAt)
+    {
+        if (endAt.HasValue)
+            return NormalizeStudioDateTime(endAt.Value);
+
+        var settings = await _settingsService.GetOwnerSettingsAsync();
+        return normalizedStartAt.AddMinutes(settings.DefaultSessionDurationMinutes);
+    }
+
+    internal static CompleteSessionDto BuildCompletionRequest(UpdateSessionDto request)
+    {
+        if (ConsultationSessions.IsConsultation(request.PlannedSessionType))
+            return new CompleteSessionDto { ActualSessionType = ConsultationSessions.SessionType, CorrectionReason = request.CorrectionReason };
+
+        var actualSessionType = ResolveActualSessionTypeForCompletion(request);
+
+        return new CompleteSessionDto
+        {
+            ActualSessionType = actualSessionType.ToString(),
+            CorrectionReason = request.CorrectionReason,
+            Participants = request.Participants!
+                .Select(p => new CompleteSessionParticipantDto
+                {
+                    ClientId = p.ClientId,
+                    AttendanceStatus = "Present",
+                    CountsAgainstPackage = p.CountsAgainstPackage,
+                    SessionsCharged = NormalizeSessionsCharged(p.SessionsCharged),
+                    Note = p.Note
+                })
+                .ToList()
+        };
+    }
+
+    private static SessionBillingType ResolveActualSessionTypeForCompletion(CreateSessionDto request)
+    {
+        if (request.IsPubliclyBookable) return SessionBillingType.Group;
+        if (!string.IsNullOrWhiteSpace(request.PlannedSessionType) &&
+            Enum.TryParse<SessionBillingType>(request.PlannedSessionType, out var plannedSessionType))
+        {
+            return plannedSessionType;
+        }
+
+        return request.Participants!.Count switch
+        {
+            1 => SessionBillingType.OneToOne,
+            2 => SessionBillingType.TwoToOne,
+            3 => SessionBillingType.ThreeToOne,
+            4 => SessionBillingType.FourToOne,
+            _ => throw new InvalidOperationException("Completed session can have at most four billable participants.")
+        };
+    }
+
+    private static SessionBillingType ResolveActualSessionTypeForCompletion(UpdateSessionDto request)
+    {
+        if (request.IsPubliclyBookable) return SessionBillingType.Group;
+        if (!string.IsNullOrWhiteSpace(request.PlannedSessionType) &&
+            Enum.TryParse<SessionBillingType>(request.PlannedSessionType, out var plannedSessionType))
+        {
+            return plannedSessionType;
+        }
+
+        return request.Participants!.Count switch
+        {
+            1 => SessionBillingType.OneToOne,
+            2 => SessionBillingType.TwoToOne,
+            3 => SessionBillingType.ThreeToOne,
+            4 => SessionBillingType.FourToOne,
+            _ => throw new InvalidOperationException("Completed session can have at most four billable participants.")
+        };
+    }
+
+    private async Task<ClientPackage?> ResolveActiveClientPackageAsync(
+        int clientId,
+        string? plannedSessionType,
+        int sessionLocationId)
+    {
+        var isGroupSession = IsGroupSessionType(plannedSessionType);
+
+        return await _context.ClientPackages
+            .Where(cp => cp.ClientId == clientId && cp.IsActive)
+            .Where(cp => isGroupSession
+                ? cp.ExpectedBillingType == SessionBillingType.Group
+                : (cp.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.SessionBased && cp.ExpectedBillingType != SessionBillingType.Group))
+            // Personal/semi packages may cover an occasional session in another location; the session's location wins.
+            .Where(cp => !isGroupSession || cp.LocationId == null || cp.LocationId == sessionLocationId)
+            .OrderByDescending(cp => cp.LocationId == null || cp.LocationId == sessionLocationId)
+            .ThenByDescending(cp => cp.PurchaseDate)
+            .FirstOrDefaultAsync();
+    }
+
+    private async Task TrySyncSessionToOutlookAsync(int sessionId)
+    {
+        if (_context.OrganizationId != StudioCRMDbContext.LegacyOrganizationId) return;
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            await _outlookCalendarSyncService.SyncSessionAsync(sessionId);
+            _logger.LogInformation("Outlook sync of session {SessionId} took {ElapsedMs} ms.", sessionId, stopwatch.ElapsedMilliseconds);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not sync session {SessionId} to Outlook.", sessionId);
+        }
+    }
+
+    private async Task<(bool IsSynced, string? Warning)> TrySyncSessionSeriesToOutlookAsync(
+        string recurringGroupId,
+        SessionRecurrenceDto recurrence)
+    {
+        if (_context.OrganizationId != StudioCRMDbContext.LegacyOrganizationId) return (false, "Outlook is not enabled for this organization; series saved in CRM.");
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        try
+        {
+            await _outlookCalendarSyncService.SyncSessionSeriesAsync(recurringGroupId, recurrence);
+            _logger.LogInformation("Outlook sync of series {SeriesId} took {ElapsedMs} ms.", recurringGroupId, stopwatch.ElapsedMilliseconds);
+            return (true, null);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not sync session series {RecurringGroupId} to Outlook.", recurringGroupId);
+            var detail = ex.GetBaseException().Message.Trim();
+            if (detail.Length > 600)
+                detail = detail[..600];
+
+            return (false, $"Series exists in CRM, but Outlook synchronization failed: {detail}");
+        }
+    }
+
+    private static string ResolveSessionTitle(
+        string? requestedTitle,
+        List<Client> clients,
+        bool isPubliclyBookable,
+        string? plannedSessionType,
+        string? currentTitle = null)
+    {
+        if (!string.IsNullOrWhiteSpace(requestedTitle))
+            return requestedTitle.Trim();
+
+        if (ConsultationSessions.IsConsultation(plannedSessionType))
+            return string.IsNullOrWhiteSpace(currentTitle) ? ConsultationSessions.DefaultTitle : currentTitle;
+
+        if (!SessionTitleBuilder.ShouldDeriveFromParticipants(isPubliclyBookable, plannedSessionType))
+        {
+            if (!string.IsNullOrWhiteSpace(currentTitle))
+                return currentTitle;
+
+            throw new InvalidOperationException("Group class title is required.");
+        }
+
+        return SessionTitleBuilder.Build(clients);
+    }
+
+    private async Task TryDeleteSessionFromOutlookAsync(int sessionId)
+    {
+        if (_context.OrganizationId != StudioCRMDbContext.LegacyOrganizationId) return;
+        try
+        {
+            await _outlookCalendarSyncService.DeleteSessionEventAsync(sessionId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not delete Outlook event for session {SessionId}.", sessionId);
+        }
+    }
+
+    private static DateTime NormalizeStudioDateTime(DateTime value)
+    {
+        return value.Kind switch
+        {
+            DateTimeKind.Utc => value,
+            DateTimeKind.Local => value.ToUniversalTime(),
+            _ => TimeZoneInfo.ConvertTimeToUtc(
+                DateTime.SpecifyKind(value, DateTimeKind.Unspecified),
+                GetStudioTimeZone())
+        };
+    }
+
+    private static TimeZoneInfo GetStudioTimeZone()
+    {
+        foreach (var id in new[] { "Europe/Warsaw", OutlookStudioTimeZone })
+        {
+            try
+            {
+                return TimeZoneInfo.FindSystemTimeZoneById(id);
+            }
+            catch (TimeZoneNotFoundException)
+            {
+            }
+            catch (InvalidTimeZoneException)
+            {
+            }
+        }
+
+        return TimeZoneInfo.Utc;
+    }
+
+    private static (int Year, int Month) GetStudioYearMonth(DateTime value)
+    {
+        var utc = value.Kind == DateTimeKind.Utc
+            ? value
+            : DateTime.SpecifyKind(value, DateTimeKind.Utc);
+
+        var local = TimeZoneInfo.ConvertTimeFromUtc(utc, GetStudioTimeZone());
+        return (local.Year, local.Month);
+    }
+
+    private async Task<List<SessionDto>> MapSessionDtosAsync(List<Session> sessions)
+    {
+        var result = new List<SessionDto>();
+        var ids = sessions.Select(s => s.Id).ToArray();
+        var counts = await _context.Sessions.AsNoTracking().Where(s => ids.Contains(s.Id))
+            .Select(s => new { s.Id,
+                Count = _context.SessionParticipants.Count(p => !p.Session.IsDeleted && p.Session.Status != "Cancelled" &&
+                    p.Session.LocationId == s.LocationId && p.Session.StartAt < s.EndAt && p.Session.EndAt > s.StartAt)
+                    + _context.Sessions.Where(o => o.Status != "Cancelled" && o.LocationId == s.LocationId &&
+                        o.StartAt < s.EndAt && o.EndAt > s.StartAt).Select(o => o.TrainerId).Distinct().Count()
+            }).ToDictionaryAsync(s => s.Id, s => s.Count);
+        var readableClients = await ReadableFinancialClientIdsAsync(sessions.SelectMany(s => s.Participants).Select(p => p.ClientId));
+        foreach (var session in sessions)
+        {
+            result.Add(await MapSessionDtoAsync(session, counts.GetValueOrDefault(session.Id), readableClients));
+        }
+
+        return result;
+    }
+
+    private async Task<HashSet<int>> ReadableFinancialClientIdsAsync(IEnumerable<int> ids)
+    {
+        if (_currentUser.IsOwner) return ids.ToHashSet();
+        var clientIds = ids.Distinct().ToArray();
+        return (await _context.Clients.AsNoTracking().Where(c => clientIds.Contains(c.Id) &&
+            c.Trainer != null && c.Trainer.UserId == _currentUser.UserId).Select(c => c.Id).ToListAsync()).ToHashSet();
+    }
+
+    private async Task<SessionDto> MapSessionDtoAsync(Session s, int? occupancy = null, HashSet<int>? readableClients = null)
+    {
+        readableClients ??= await ReadableFinancialClientIdsAsync(s.Participants.Select(p => p.ClientId));
+        var participants = s.Participants
+            .OrderBy(p => p.Client.FirstName)
+            .ThenBy(p => p.Client.LastName)
+            .ToList();
+        var outlookCategories = ReadStringList(s.OutlookCategoriesJson);
+        var outlookCategoryColors = ReadOutlookCategoryColors(
+            s.OutlookCategoryColorsJson,
+            outlookCategories,
+            s.Trainer.OutlookCategoryName,
+            s.Trainer.OutlookCategoryColor);
+        var primaryOutlookCategory = s.PrimaryOutlookCategory ?? outlookCategories.FirstOrDefault();
+
+        var locationParticipantsCount = occupancy ?? await CountPeopleInLocationForTimeRangeAsync(
+            s.LocationId,
+            s.StartAt,
+            s.EndAt);
+
+        var canEdit = _currentUser.IsOwner ||
+            (_currentUser.IsTrainer && s.Trainer.UserId == _currentUser.UserId);
+
+        return new SessionDto
+        {
+            Id = s.Id,
+            Title = s.Title,
+            Note = canEdit ? s.Note : null,
+            StartAt = ToStudioDisplayDateTime(s.StartAt),
+            EndAt = ToStudioDisplayDateTime(s.EndAt),
+            TrainerId = s.TrainerId,
+            TrainerFullName = s.Trainer.User.FirstName + " " + s.Trainer.User.LastName,
+            CanEdit = canEdit,
+            LocationId = s.LocationId,
+            LocationName = s.Location.Name,
+            Status = s.Status,
+            IsPubliclyBookable = s.IsPubliclyBookable,
+            PublicSlug = s.PublicSlug,
+            EventRules = s.EventRules,
+            BookingRules = GroupBookingPolicy.Describe(s),
+            IsGroupSession = GroupBookingPolicy.IsGroup(s),
+            Capacity = s.PublicCapacity,
+            BookedSeats = GroupBookingPolicy.BookedSeats(s),
+            AvailableSeats = GroupBookingPolicy.AvailableSeats(s),
+            IsFullyBooked = GroupBookingPolicy.IsFullyBooked(s),
+            PublicCapacity = s.PublicCapacity,
+            PublicAvailableSpots = s.IsPubliclyBookable && s.PublicCapacity.HasValue
+                ? Math.Max(0, s.PublicCapacity.Value - participants.Count(p => p.AttendanceStatus != "CancelledInTime" && p.AttendanceStatus != "CancelledLate"))
+                : null,
+            PlannedSessionType = s.PlannedSessionType,
+            ActualSessionType = s.ActualSessionType,
+            ActualParticipantsCount = s.ActualParticipantsCount,
+            CompletedAt = s.CompletedAt.HasValue ? ToStudioDisplayDateTime(s.CompletedAt.Value) : null,
+            ParticipantsCount = participants.Count,
+            ClientsDisplayName = SessionTitleBuilder.Build(participants.Select(p => p.Client).ToList()),
+            LocationParticipantsCount = locationParticipantsCount,
+            LocationLimit = LocationPeopleLimit,
+            IsLocationLimitExceeded = locationParticipantsCount > LocationPeopleLimit,
+            Participants = participants.Select(p => new SessionParticipantListDto
+            {
+                Id = p.Id,
+                ClientId = p.ClientId,
+                ClientFullName = p.Client.FirstName + " " + p.Client.LastName,
+                TrainerProfileUrl = $"/api/trainer-portal/sessions/{s.Id}/participants/{p.ClientId}/profile",
+                PackageId = readableClients.Contains(p.ClientId) ? p.PackageId : null,
+                PackageName = readableClients.Contains(p.ClientId) && p.Package != null ? p.Package.Name : null,
+                ClientPackageId = readableClients.Contains(p.ClientId) ? p.ClientPackageId : null,
+                AttendanceStatus = p.AttendanceStatus,
+                CountsAgainstPackage = p.CountsAgainstPackage,
+                IsCountedFromPackage = p.IsCountedFromPackage,
+                SessionsCharged = p.SessionsCharged,
+                PlannedBillingType = p.PlannedBillingType != null ? p.PlannedBillingType.ToString()! : string.Empty,
+                ActualBillingType = p.ActualBillingType != null ? p.ActualBillingType.ToString()! : string.Empty,
+                ExpectedUnitPrice = readableClients.Contains(p.ClientId) ? p.ExpectedUnitPrice ?? 0 : 0,
+                ActualUnitPrice = readableClients.Contains(p.ClientId) ? p.ActualUnitPrice ?? 0 : 0,
+                BalanceDifference = readableClients.Contains(p.ClientId) ? p.BalanceDifference ?? 0 : 0,
+                Note = readableClients.Contains(p.ClientId) ? p.Note : null
+            }).ToList(),
+            CreatedAt = s.CreatedAt,
+            UpdatedAt = s.UpdatedAt,
+            CreatedBy = s.CreatedBy,
+            OutlookCategories = outlookCategories,
+            OutlookCategoryColors = outlookCategoryColors,
+            PrimaryOutlookCategory = primaryOutlookCategory,
+            PrimaryOutlookCategoryColor = outlookCategoryColors
+                .FirstOrDefault(c => string.Equals(c.Name, primaryOutlookCategory, StringComparison.OrdinalIgnoreCase))
+                ?.Color,
+            IsRecurring = s.IsRecurring,
+            RecurringGroupId = s.RecurringGroupId,
+            RecurrenceInstanceNumber = s.RecurrenceInstanceNumber
+        };
+    }
+
+    private static List<DateTime> BuildSeriesOccurrenceStarts(
+        DateTime requestedStartAt,
+        SessionRecurrenceDto recurrence)
+    {
+
+        var frequency = NormalizeSeriesFrequency(recurrence.Frequency);
+        if (recurrence.Interval is < 1 or > 12)
+            throw new InvalidOperationException("Recurrence interval must be between 1 and 12.");
+
+        var requestedCount = recurrence.OccurrencesCount ??
+            (recurrence.EndDate.HasValue ? MaxSeriesOccurrencesCount : DefaultSeriesOccurrencesCount);
+        if (requestedCount is < 2 or > MaxSeriesOccurrencesCount)
+            throw new InvalidOperationException($"A series must contain between 2 and {MaxSeriesOccurrencesCount} sessions.");
+
+        var localStart = ToStudioDisplayDateTime(NormalizeStudioDateTime(requestedStartAt));
+        var localEndDate = recurrence.EndDate.HasValue
+            ? ToStudioDisplayDateTime(NormalizeStudioDateTime(recurrence.EndDate.Value)).Date
+            : (DateTime?)null;
+        if (localEndDate.HasValue && localEndDate.Value < localStart.Date)
+            throw new InvalidOperationException("Series end date cannot be earlier than its first session.");
+
+        var daysOfWeek = ResolveSeriesDaysOfWeek(frequency, recurrence.DaysOfWeek, localStart.DayOfWeek);
+        var anchorMonday = localStart.Date.AddDays(-((7 + (int)localStart.DayOfWeek - (int)DayOfWeek.Monday) % 7));
+        var results = new List<DateTime>();
+        var candidateDate = localStart.Date;
+        var safetyEndDate = localEndDate ?? localStart.Date.AddYears(3);
+
+        while (candidateDate <= safetyEndDate && results.Count < requestedCount)
+        {
+            var daysFromStart = (candidateDate - localStart.Date).Days;
+            var weeksFromAnchor = (candidateDate - anchorMonday).Days / 7;
+            var matches = frequency == "Daily"
+                ? daysFromStart % recurrence.Interval == 0
+                : weeksFromAnchor % recurrence.Interval == 0 && daysOfWeek.Contains(candidateDate.DayOfWeek);
+
+            if (matches)
+            {
+                results.Add(DateTime.SpecifyKind(
+                    candidateDate.Add(localStart.TimeOfDay),
+                    DateTimeKind.Unspecified));
+            }
+
+            candidateDate = candidateDate.AddDays(1);
+        }
+
+        if (results.Count < 2)
+            throw new InvalidOperationException("Recurrence settings produce fewer than two sessions.");
+
+        return results;
+    }
+
+    private static string NormalizeSeriesFrequency(string? value)
+    {
+        var normalized = value?.Trim();
+        if (string.Equals(normalized, "Daily", StringComparison.OrdinalIgnoreCase))
+            return "Daily";
+        if (string.Equals(normalized, "Weekly", StringComparison.OrdinalIgnoreCase))
+            return "Weekly";
+
+        throw new InvalidOperationException("Recurrence frequency must be Daily or Weekly.");
+    }
+
+    private static HashSet<DayOfWeek> ResolveSeriesDaysOfWeek(
+        string frequency,
+        List<string>? values,
+        DayOfWeek defaultDay)
+    {
+        if (frequency == "Daily")
+            return new HashSet<DayOfWeek>();
+
+        var days = (values ?? new List<string>())
+            .Select(value => Enum.TryParse<DayOfWeek>(value?.Trim(), true, out var day)
+                ? day
+                : (DayOfWeek?)null)
+            .ToList();
+
+        if (days.Any(day => !day.HasValue))
+            throw new InvalidOperationException("DaysOfWeek must use English weekday names, for example Monday.");
+
+        return days.Count == 0
+            ? new HashSet<DayOfWeek> { defaultDay }
+            : days.Select(day => day!.Value).ToHashSet();
+    }
+
+    private static CreateSessionDto CloneSeriesOccurrenceRequest(
+        CreateSessionDto source,
+        DateTime startAt,
+        DateTime endAt,
+        int occurrenceNumber)
+    {
+        return new CreateSessionDto
+        {
+            Title = source.Title,
+            Note = source.Note,
+            StartAt = startAt,
+            EndAt = endAt,
+            TrainerId = source.TrainerId,
+            LocationId = source.LocationId,
+            Status = "Planned",
+            IsPubliclyBookable = source.IsPubliclyBookable,
+            PublicSlug = BuildSeriesPublicSlug(source.PublicSlug, startAt, occurrenceNumber),
+            EventRules = source.EventRules,
+            RegistrationClosesBeforeMinutes = source.RegistrationClosesBeforeMinutes,
+            CancellationClosesBeforeMinutes = source.CancellationClosesBeforeMinutes,
+            PublicCapacity = source.PublicCapacity,
+            PlannedSessionType = source.PlannedSessionType,
+            OutlookCategories = source.OutlookCategories?.ToList() ?? new List<string>(),
+            Participants = source.Participants?.Select(participant => new CreateSessionParticipantDto
+            {
+                ClientId = participant.ClientId,
+                CountsAgainstPackage = participant.CountsAgainstPackage,
+                SessionsCharged = participant.SessionsCharged,
+                Note = participant.Note
+            }).ToList() ?? new List<CreateSessionParticipantDto>()
+        };
+    }
+
+    private static string? BuildSeriesPublicSlug(
+        string? value,
+        DateTime startAt,
+        int occurrenceNumber)
+    {
+        var normalized = value?.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return null;
+
+        var suffix = $"-{startAt:yyyyMMdd-HHmm}-{occurrenceNumber}";
+        var maximumBaseLength = Math.Max(1, 120 - suffix.Length);
+        return normalized[..Math.Min(normalized.Length, maximumBaseLength)] + suffix;
+    }
+
+    private static List<string> ReadStringList(string? json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return new List<string>();
+
+        try
+        {
+            return JsonSerializer.Deserialize<List<string>>(json) ?? new List<string>();
+        }
+        catch
+        {
+            return new List<string>();
+        }
+    }
+
+    private static string? SerializeOutlookCategories(List<string>? categories)
+    {
+        var normalized = NormalizeOutlookCategories(categories);
+
+        return normalized.Count == 0
+            ? null
+            : JsonSerializer.Serialize(normalized);
+    }
+
+    private static string? SerializeOutlookCategoryColors(List<OutlookCategoryDto>? categoryColors)
+    {
+        var normalized = NormalizeOutlookCategoryColors(categoryColors);
+
+        return normalized.Count == 0
+            ? null
+            : JsonSerializer.Serialize(normalized);
+    }
+
+    private static string? GetPrimaryOutlookCategory(List<string>? categories)
+    {
+        return NormalizeOutlookCategories(categories).FirstOrDefault();
+    }
+
+    private static List<string> NormalizeOutlookCategories(List<string>? categories)
+    {
+        return categories?
+            .Select(c => c.Trim())
+            .Where(c => !string.IsNullOrWhiteSpace(c))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList() ?? new List<string>();
+    }
+
+    private static List<OutlookCategoryDto> NormalizeOutlookCategoryColors(
+        List<OutlookCategoryDto>? categoryColors)
+    {
+        return categoryColors?
+            .Select(c => new OutlookCategoryDto
+            {
+                Name = c.Name.Trim(),
+                Color = string.IsNullOrWhiteSpace(c.Color) ? null : c.Color.Trim()
+            })
+            .Where(c => !string.IsNullOrWhiteSpace(c.Name))
+            .GroupBy(c => c.Name, StringComparer.OrdinalIgnoreCase)
+            .Select(g => g.First())
+            .ToList() ?? new List<OutlookCategoryDto>();
+    }
+
+    private static List<OutlookCategoryDto> ReadOutlookCategoryColors(
+        string? json,
+        List<string> categories,
+        string? trainerCategoryName,
+        string? trainerCategoryColor)
+    {
+        var result = new List<OutlookCategoryDto>();
+
+        if (!string.IsNullOrWhiteSpace(json))
+        {
+            try
+            {
+                result = JsonSerializer.Deserialize<List<OutlookCategoryDto>>(json)
+                    ?? new List<OutlookCategoryDto>();
+            }
+            catch
+            {
+                result = new List<OutlookCategoryDto>();
+            }
+        }
+
+        result = NormalizeOutlookCategoryColors(result);
+
+        // The trainer's own category always uses the trainer colour from CRM; the colour stored from Outlook
+        // (the mailbox master category) may differ or be missing.
+        var trainerColor = NormalizeOutlookCategoryColor(trainerCategoryColor);
+        foreach (var stored in result.Where(c => trainerColor is not null &&
+                     string.Equals(c.Name, trainerCategoryName, StringComparison.OrdinalIgnoreCase)))
+            stored.Color = trainerColor;
+
+        foreach (var category in categories)
+        {
+            if (result.Any(c => string.Equals(c.Name, category, StringComparison.OrdinalIgnoreCase)))
+                continue;
+
+            result.Add(new OutlookCategoryDto
+            {
+                Name = category,
+                Color = string.Equals(category, trainerCategoryName, StringComparison.OrdinalIgnoreCase)
+                    ? NormalizeOutlookCategoryColor(trainerCategoryColor)
+                    : null
+            });
+        }
+
+        return NormalizeOutlookCategoryColors(result);
+    }
+
+    private async Task<List<string>> ResolveOutlookCategoriesForTrainerAsync(
+        int trainerId,
+        List<string>? requestedCategories,
+        bool isGroupSession,
+        bool isConsultation = false)
+    {
+        var trainerCategory = await _context.Trainers
+            .Where(t => t.Id == trainerId)
+            .Select(t => t.OutlookCategoryName)
+            .FirstOrDefaultAsync();
+
+        var categories = new List<string>();
+
+        if (isGroupSession)
+            categories.Add(SessionTitleBuilder.GroupClassOutlookCategory);
+
+        if (!string.IsNullOrWhiteSpace(trainerCategory))
+            categories.Add(trainerCategory);
+
+        if (isConsultation)
+            categories.Add(ConsultationSessions.OutlookCategory);
+
+        categories.AddRange(requestedCategories ?? new List<string>());
+
+        return NormalizeOutlookCategories(categories);
+    }
+
+    private async Task<List<OutlookCategoryDto>> ResolveOutlookCategoryColorsForTrainerAsync(
+        int trainerId,
+        List<string> categories,
+        bool isGroupSession)
+    {
+        var trainerCategory = await _context.Trainers
+            .Where(t => t.Id == trainerId)
+            .Select(t => new
+            {
+                t.OutlookCategoryName,
+                t.OutlookCategoryColor
+            })
+            .FirstOrDefaultAsync();
+
+        return categories
+            .Select(category => new OutlookCategoryDto
+            {
+                Name = category,
+                Color = isGroupSession && string.Equals(
+                    category,
+                    SessionTitleBuilder.GroupClassOutlookCategory,
+                    StringComparison.OrdinalIgnoreCase)
+                    ? "preset0"
+                    : string.Equals(category, ConsultationSessions.OutlookCategory, StringComparison.OrdinalIgnoreCase)
+                    ? ConsultationSessions.OutlookCategoryColor
+                    : trainerCategory is not null &&
+                    string.Equals(category, trainerCategory.OutlookCategoryName, StringComparison.OrdinalIgnoreCase)
+                    ? NormalizeOutlookCategoryColor(trainerCategory.OutlookCategoryColor)
+                    : null
+            })
+            .ToList();
+    }
+
+    private static string? NormalizeOutlookCategoryColor(string? value)
+    {
+        var normalized = value?.Trim();
+
+        return string.IsNullOrWhiteSpace(normalized)
+            ? null
+            : normalized;
+    }
+
+    private static DateTime ToStudioDisplayDateTime(DateTime value)
+    {
+        if (value.Kind == DateTimeKind.Unspecified)
+            return value;
+
+        var utc = value.Kind == DateTimeKind.Utc
+            ? value
+            : value.ToUniversalTime();
+
+        return DateTime.SpecifyKind(
+            TimeZoneInfo.ConvertTimeFromUtc(utc, GetStudioTimeZone()),
+            DateTimeKind.Unspecified);
+    }
+
+    private async Task<int> CountPeopleInLocationForTimeRangeAsync(
+        int locationId,
+        DateTime startAt,
+        DateTime endAt)
+    {
+        var overlappingSessions = await _context.Sessions
+            .Where(s =>
+                !s.IsDeleted &&
+                s.Status != "Cancelled" &&
+                s.LocationId == locationId &&
+                s.StartAt < endAt &&
+                s.EndAt > startAt)
+            .Select(s => new
+            {
+                s.Id,
+                s.TrainerId
+            })
+            .ToListAsync();
+
+        var overlappingSessionIds = overlappingSessions
+            .Select(s => s.Id)
+            .ToList();
+
+        var clientsCount = await _context.SessionParticipants
+            .Where(p => overlappingSessionIds.Contains(p.SessionId))
+            .CountAsync();
+
+        var trainersCount = overlappingSessions
+            .Select(s => s.TrainerId)
+            .Distinct()
+            .Count();
+
+        return clientsCount + trainersCount;
+    }
+
+    
+
+    private static string ResolveSessionType(int count)
+    {
+        return count switch
+        {
+            1 => "OneToOne",
+            2 => "TwoToOne",
+            3 => "ThreeToOne",
+            4 => "FourToOne",
+            _ => "Group"
+        };
+    }
+
+    private static int NormalizeSessionsCharged(int value)
+    {
+        return Math.Max(1, value);
+    }
+
+    private static bool IsGroupSessionType(string? value)
+    {
+        return !string.IsNullOrWhiteSpace(value) &&
+            value.Trim().Equals(SessionBillingType.Group.ToString(), StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static int? NormalizePublicCapacity(bool isPubliclyBookable, int? capacity)
+    {
+        if (!isPubliclyBookable && !capacity.HasValue)
+            return null;
+
+        if (!capacity.HasValue || capacity.Value < 1)
+            throw new InvalidOperationException("Public group session capacity is required.");
+
+        if (capacity.Value > 100)
+            throw new InvalidOperationException("Public group session capacity cannot exceed 100.");
+
+        return capacity.Value;
+    }
+
+    private static string? NormalizePublicSlug(string? value)
+    {
+        var normalized = value?.Trim().ToLowerInvariant();
+        return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
+    }
+
+    private sealed class TrainerCapacityInterval
+    {
+        public int? SessionId { get; set; }
+
+        public DateTime StartAt { get; set; }
+
+        public DateTime EndAt { get; set; }
+
+        public int ParticipantsCount { get; set; }
+    }
+}
+

@@ -1,0 +1,659 @@
+using StudioCRM.Application.Common;
+using System.Security.Cryptography;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using StudioCRM.Application.DTOs.Invitations;
+using StudioCRM.Application.Interfaces;
+using StudioCRM.Application.Interfaces.Mail;
+using StudioCRM.Application.Settings;
+using StudioCRM.Domain.Entities;
+using StudioCRM.Infrastructure.Persistence;
+
+namespace StudioCRM.Infrastructure.Services;
+
+public class InvitationService : IInvitationService
+{
+    private const int LastSendErrorMaxLength = 2000;
+
+    private readonly StudioCRMDbContext _context;
+    private readonly ICurrentUserService _currentUser;
+    private readonly PasswordHasher<User> _passwordHasher;
+    private readonly AppSettings _appSettings;
+    private readonly IEmailService _emailService;
+
+    public InvitationService(
+        StudioCRMDbContext context,
+        ICurrentUserService currentUser,
+        IOptions<AppSettings> appOptions,
+        IEmailService emailService)
+    {
+        _context = context;
+        _currentUser = currentUser;
+        _passwordHasher = new PasswordHasher<User>();
+        _appSettings = appOptions.Value;
+        _emailService = emailService;
+    }
+
+    public async Task<InvitationDto> CreateAsync(CreateInvitationDto request)
+    {
+        await LegacyStaffMembership.RequireLegacyAsync(_context);
+        if (!_currentUser.UserId.HasValue)
+            throw new InvalidOperationException("User is not authenticated.");
+
+        var email = NormalizeEmail(request.Email);
+        var role = NormalizeRole(request.Role);
+
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        // Prevent concurrent requests from issuing multiple invitations for one email or client.
+        await _context.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock(hashtextextended({email}, 71844730))");
+        if (request.ClientId.HasValue)
+            await _context.Database.ExecuteSqlInterpolatedAsync($"SELECT pg_advisory_xact_lock(71844731, {request.ClientId.Value})");
+
+        if (string.IsNullOrWhiteSpace(email))
+            throw new InvalidOperationException("Email is required.");
+        if (!System.Net.Mail.MailAddress.TryCreate(email, out var address) || address.Address != email)
+            throw new InvalidOperationException("Email is invalid.");
+
+        if (role != "Trainer" && role != "Client")
+            throw new InvalidOperationException("Only Trainer and Client invitations are supported.");
+
+        if (request.ClientId.HasValue)
+        {
+            if (role != "Client")
+                throw new InvalidOperationException("ClientId is supported only for client invitations.");
+            var client = await _context.Clients.FirstOrDefaultAsync(c => c.Id == request.ClientId.Value)
+                ?? throw new InvalidOperationException("Client does not exist or is archived.");
+            if (client.UserId.HasValue || client.PortalAccessBlocked)
+                throw new InvalidOperationException("Client already has an account or portal access is blocked.");
+            if (!_currentUser.IsOwner && !await _context.Trainers.AnyAsync(t =>
+                    t.Id == client.TrainerId && t.UserId == _currentUser.UserId))
+                throw new UnauthorizedAccessException("Cannot invite this client.");
+            if (await _context.Invitations.AnyAsync(i => i.ClientId == client.Id &&
+                    !i.IsAccepted && i.CancelledAt == null && i.ExpiresAt > DateTime.UtcNow))
+                throw new InvalidOperationException("Client already has an active invitation.");
+            request.LocationId = client.LocationId;
+            request.TrainerId = client.TrainerId;
+        }
+        else if (role == "Client" && await _context.Clients.IncludingOrganizationArchive(_context.OrganizationId).AnyAsync(c => c.Email.ToLower() == email))
+        {
+            throw new InvalidOperationException("A client with this email exists. Invite the existing client using ClientId.");
+        }
+
+        var trainerId = await ResolveInvitationTrainerIdAsync(role, request.LocationId, request.TrainerId);
+
+        if (!_currentUser.IsOwner)
+        {
+            if (!_currentUser.IsTrainer || role != "Client")
+                throw new InvalidOperationException("Trainer can invite only clients.");
+        }
+
+        var location = await _context.Locations.FirstOrDefaultAsync(l => l.Id == request.LocationId);
+        if (location is null)
+            throw new InvalidOperationException("Location does not exist.");
+
+        var existingUser = await _context.Users.AnyAsync(u => u.Email.ToLower() == email);
+        if (existingUser)
+            throw new InvalidOperationException("User with this email already exists.");
+
+        var existingPendingInvitation = await _context.Invitations
+            .AnyAsync(i =>
+                i.Email.ToLower() == email &&
+                !i.IsAccepted &&
+                i.CancelledAt == null &&
+                i.ExpiresAt > DateTime.UtcNow);
+
+        if (existingPendingInvitation)
+            throw new InvalidOperationException("There is already an active invitation for this email.");
+
+        var invitation = new Invitation
+        {
+            Email = email,
+            Role = role,
+            ClientId = request.ClientId,
+            Token = GenerateToken(),
+            LocationId = request.LocationId,
+            Location = location,
+            TrainerId = trainerId,
+            ExpiresAt = DateTime.UtcNow.AddDays(3),
+            IsAccepted = false,
+            CreatedAt = DateTime.UtcNow,
+            CreatedBy = _currentUser.UserId.Value
+        };
+
+        await _context.Invitations.AddAsync(invitation);
+        await _context.SaveChangesAsync();
+        await transaction.CommitAsync();
+
+        var inviteLink = $"{_appSettings.FrontendBaseUrl}/accept-invitation?token={invitation.Token}";
+
+        await SendInvitationEmailAndTrackResultAsync(invitation, location.Name, inviteLink);
+
+        return MapToDto(await LoadInvitationForDtoAsync(invitation.Id) ?? invitation);
+    }
+
+    public async Task<List<InvitationDto>> GetAllAsync(InvitationFilterDto? filter = null)
+    {
+        var query = _context.Invitations
+            .Include(i => i.Location)
+            .Include(i => i.Trainer)
+                .ThenInclude(t => t!.User)
+            .AsQueryable();
+
+        if (!_currentUser.IsOwner)
+        {
+            if (!_currentUser.UserId.HasValue)
+                return new List<InvitationDto>();
+
+            query = query.Where(i => i.CreatedBy == _currentUser.UserId.Value);
+        }
+
+        if (filter is not null)
+        {
+            if (!string.IsNullOrWhiteSpace(filter.Role))
+            {
+                var role = NormalizeRole(filter.Role);
+                query = query.Where(i => i.Role == role);
+            }
+
+            if (filter.LocationId.HasValue)
+                query = query.Where(i => i.LocationId == filter.LocationId.Value);
+
+            if (filter.TrainerId.HasValue)
+                query = query.Where(i => i.TrainerId == filter.TrainerId.Value);
+
+            if (!string.IsNullOrWhiteSpace(filter.Search))
+            {
+                var search = filter.Search.ToLower();
+                query = query.Where(i => i.Email.ToLower().Contains(search));
+            }
+
+            if (!string.IsNullOrWhiteSpace(filter.Status))
+            {
+                var now = DateTime.UtcNow;
+                var status = filter.Status.Trim();
+
+                query = status switch
+                {
+                    var value when value.Equals("Pending", StringComparison.OrdinalIgnoreCase) =>
+                        query.Where(i => !i.IsAccepted && i.CancelledAt == null && i.ExpiresAt > now),
+                    var value when value.Equals("Accepted", StringComparison.OrdinalIgnoreCase) =>
+                        query.Where(i => i.IsAccepted),
+                    var value when value.Equals("Expired", StringComparison.OrdinalIgnoreCase) =>
+                        query.Where(i => !i.IsAccepted && i.CancelledAt == null && i.ExpiresAt <= now),
+                    var value when value.Equals("Cancelled", StringComparison.OrdinalIgnoreCase) =>
+                        query.Where(i => i.CancelledAt != null),
+                    _ => query
+                };
+            }
+        }
+
+        var invitations = await query
+            .OrderByDescending(i => i.CreatedAt)
+            .ToListAsync();
+
+        return invitations
+            .Select(MapToDto)
+            .ToList();
+    }
+
+    public async Task<InvitationDto?> GetByIdAsync(int id)
+    {
+        var invitation = await _context.Invitations
+            .Include(i => i.Location)
+                .ThenInclude(l => l.LegalEntity)
+            .Include(i => i.Trainer)
+                .ThenInclude(t => t!.User)
+            .FirstOrDefaultAsync(i => i.Id == id);
+
+        if (invitation is null)
+            return null;
+
+        if (!_currentUser.IsOwner && invitation.CreatedBy != _currentUser.UserId)
+            return null;
+
+        return MapToDto(invitation);
+    }
+
+    public async Task<ValidateInvitationDto?> ValidateAsync(string token)
+    {
+        var invitation = await _context.Invitations
+            .Include(i => i.Client)
+            .Include(i => i.Location)
+                .ThenInclude(l => l.LegalEntity)
+            .Include(i => i.Trainer)
+                .ThenInclude(t => t!.User)
+            .FirstOrDefaultAsync(i => i.Token == token);
+
+        if (invitation is null ||
+            invitation.IsAccepted ||
+            invitation.CancelledAt != null ||
+            invitation.ExpiresAt <= DateTime.UtcNow)
+            return null;
+
+        return new ValidateInvitationDto
+        {
+            ClientId = invitation.ClientId,
+            FirstName = invitation.Client?.FirstName,
+            LastName = invitation.Client?.LastName,
+            Email = invitation.Email,
+            Role = invitation.Role,
+            LocationId = invitation.LocationId,
+            LocationName = GetLocationName(invitation),
+            TrainerId = invitation.TrainerId,
+            TrainerName = GetTrainerName(invitation),
+            ExpiresAt = invitation.ExpiresAt,
+            LegalEntityId = invitation.Location.LegalEntityId,
+            LegalEntityName = invitation.Location.LegalEntity?.Name,
+            TermsAcceptanceRequired = !string.IsNullOrWhiteSpace(invitation.Location.LegalEntity?.TermsVersion) &&
+                !string.IsNullOrWhiteSpace(invitation.Location.LegalEntity?.TermsUrl),
+            TermsVersion = invitation.Location.LegalEntity?.TermsVersion,
+            TermsUrl = invitation.Location.LegalEntity?.TermsUrl
+        };
+    }
+
+    public async Task<bool> AcceptAsync(AcceptInvitationDto request)
+    {
+        await LegacyStaffMembership.RequireLegacyAsync(_context);
+        await using var transaction = await _context.Database.BeginTransactionAsync(System.Data.IsolationLevel.Serializable);
+        if (string.IsNullOrWhiteSpace(request.FirstName))
+            throw new InvalidOperationException("First name is required.");
+
+        if (string.IsNullOrWhiteSpace(request.LastName))
+            throw new InvalidOperationException("Last name is required.");
+
+        if (string.IsNullOrWhiteSpace(request.Password))
+            throw new InvalidOperationException("Password is required.");
+
+        var invitation = await _context.Invitations
+            .Include(i => i.Location)
+                .ThenInclude(l => l.LegalEntity)
+            .Include(i => i.Trainer)
+                .ThenInclude(t => t!.User)
+            .FirstOrDefaultAsync(i => i.Token == request.Token);
+
+        if (invitation is null ||
+            invitation.IsAccepted ||
+            invitation.CancelledAt != null ||
+            invitation.ExpiresAt <= DateTime.UtcNow)
+            return false;
+
+        var existingUser = await _context.Users.AnyAsync(u => u.Email.ToLower() == invitation.Email.ToLower());
+        if (existingUser)
+            throw new InvalidOperationException("User with this email already exists.");
+
+        var role = await _context.Roles.FirstOrDefaultAsync(r => r.Name == invitation.Role);
+        if (role is null)
+            throw new InvalidOperationException("Role does not exist.");
+
+        var legalRequirements = await LegalConsentManager.GetRequirementsAsync(
+            _context,
+            invitation.LocationId);
+        if (legalRequirements.AcceptanceRequired &&
+            (!request.AcceptTerms || !string.Equals(
+                request.TermsVersion?.Trim(),
+                legalRequirements.TermsVersion,
+                StringComparison.Ordinal)))
+        {
+            throw new InvalidOperationException("Current terms must be accepted before activating the account.");
+        }
+
+        if (invitation.ClientId.HasValue && !await _context.Clients.AnyAsync(c =>
+                c.Id == invitation.ClientId && c.UserId == null && !c.PortalAccessBlocked))
+            throw new InvalidOperationException("Client is archived, blocked or already has an account.");
+
+        var user = new User
+        {
+            Email = invitation.Email,
+            FirstName = request.FirstName.Trim(),
+            LastName = request.LastName.Trim(),
+            IsActive = true,
+            EmailVerifiedAt = DateTime.UtcNow,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        user.PasswordHash = _passwordHasher.HashPassword(user, request.Password);
+
+        await _context.Users.AddAsync(user);
+        await _context.SaveChangesAsync();
+
+        await _context.UserRoles.AddAsync(new UserRole
+        {
+            UserId = user.Id,
+            RoleId = role.Id
+        });
+
+        await _context.SaveChangesAsync();
+
+        await LegacyStaffMembership.TrackAsync(_context, user.Id, invitation.Role);
+
+        if (invitation.Role == "Trainer")
+            await CreateTrainerProfileAsync(user, invitation);
+        else if (invitation.Role == "Client")
+            await CreateClientProfileAsync(user, invitation, request);
+
+        await LegalConsentManager.AcceptAsync(
+            _context,
+            user.Id,
+            invitation.LocationId,
+            request.AcceptTerms,
+            request.TermsVersion,
+            "InvitationAcceptance");
+
+        invitation.IsAccepted = true;
+        invitation.AcceptedAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync();
+
+        await transaction.CommitAsync();
+
+        return true;
+    }
+
+    public async Task<InvitationDto?> ResendAsync(int id)
+    {
+        await LegacyStaffMembership.RequireLegacyAsync(_context);
+        var invitation = await _context.Invitations
+            .Include(i => i.Location)
+            .Include(i => i.Trainer)
+                .ThenInclude(t => t!.User)
+            .FirstOrDefaultAsync(i => i.Id == id);
+
+        if (invitation is null)
+            return null;
+
+        if (!_currentUser.IsOwner && invitation.CreatedBy != _currentUser.UserId)
+            return null;
+
+        if (invitation.IsAccepted)
+            throw new InvalidOperationException("Accepted invitation cannot be resent.");
+
+        if (invitation.CancelledAt != null)
+            throw new InvalidOperationException("Cancelled invitation cannot be resent.");
+
+        invitation.Token = GenerateToken();
+        invitation.ExpiresAt = DateTime.UtcNow.AddDays(3);
+
+        await _context.SaveChangesAsync();
+
+        var inviteLink = $"{_appSettings.FrontendBaseUrl}/accept-invitation?token={invitation.Token}";
+
+        await SendInvitationEmailAndTrackResultAsync(invitation, GetLocationName(invitation), inviteLink);
+
+        return MapToDto(invitation);
+    }
+
+    public async Task<bool> CancelAsync(int id)
+    {
+        var invitation = await _context.Invitations.FirstOrDefaultAsync(i => i.Id == id);
+
+        if (invitation is null)
+            return false;
+
+        if (!_currentUser.IsOwner && invitation.CreatedBy != _currentUser.UserId)
+            return false;
+
+        if (invitation.IsAccepted)
+            throw new InvalidOperationException("Accepted invitation cannot be cancelled.");
+
+        if (invitation.CancelledAt is not null)
+            return true;
+
+        invitation.CancelledAt = DateTime.UtcNow;
+        await _context.SaveChangesAsync();
+
+        return true;
+    }
+
+    private async Task<int?> ResolveInvitationTrainerIdAsync(
+        string role,
+        int locationId,
+        int? requestedTrainerId)
+    {
+        if (role != "Client")
+        {
+            if (requestedTrainerId.HasValue)
+                throw new InvalidOperationException("Trainer can be assigned only to client invitations.");
+
+            return null;
+        }
+
+        if (_currentUser.IsOwner)
+        {
+            if (!requestedTrainerId.HasValue)
+                return null;
+
+            await EnsureTrainerCanInviteToLocationAsync(requestedTrainerId.Value, locationId);
+            return requestedTrainerId.Value;
+        }
+
+        if (!_currentUser.IsTrainer || !_currentUser.UserId.HasValue)
+            throw new InvalidOperationException("Trainer can invite only clients.");
+
+        var trainer = await _context.Trainers
+            .Include(t => t.TrainerLocations)
+            .FirstOrDefaultAsync(t => t.UserId == _currentUser.UserId.Value && !t.IsDeleted);
+
+        if (trainer is null)
+            throw new InvalidOperationException("Trainer profile not found.");
+
+        if (requestedTrainerId.HasValue && requestedTrainerId.Value != trainer.Id)
+            throw new InvalidOperationException("Trainer can assign invitations only to themselves.");
+
+        EnsureTrainerHasLocationAccess(trainer, locationId);
+        return trainer.Id;
+    }
+
+    private async Task EnsureTrainerCanInviteToLocationAsync(int trainerId, int locationId)
+    {
+        var trainer = await _context.Trainers
+            .Include(t => t.TrainerLocations)
+            .FirstOrDefaultAsync(t => t.Id == trainerId && !t.IsDeleted);
+
+        if (trainer is null)
+            throw new InvalidOperationException("Trainer does not exist.");
+
+        EnsureTrainerHasLocationAccess(trainer, locationId);
+    }
+
+    private static void EnsureTrainerHasLocationAccess(Trainer trainer, int locationId)
+    {
+        var hasLocationAccess = trainer.TrainerLocations.Any(tl => tl.LocationId == locationId);
+        if (!hasLocationAccess)
+            throw new InvalidOperationException("Trainer cannot invite clients to this location.");
+    }
+
+    private async Task CreateTrainerProfileAsync(User user, Invitation invitation)
+    {
+        var trainer = new Trainer
+        {
+            UserId = user.Id,
+            Status = "Active",
+            TeamJoinedDate = DateTime.UtcNow.Date,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow,
+            CreatedBy = invitation.CreatedBy
+        };
+
+        await _context.Trainers.AddAsync(trainer);
+        await _context.SaveChangesAsync();
+
+        await _context.TrainerLocations.AddAsync(new TrainerLocation
+        {
+            TrainerId = trainer.Id,
+            LocationId = invitation.LocationId
+        });
+
+        await _context.SaveChangesAsync();
+    }
+
+    private async Task CreateClientProfileAsync(
+        User user,
+        Invitation invitation,
+        AcceptInvitationDto request)
+    {
+        if (invitation.ClientId.HasValue)
+        {
+            var existing = await _context.Clients.SingleAsync(c => c.Id == invitation.ClientId.Value);
+            if (existing.UserId.HasValue || existing.PortalAccessBlocked)
+                throw new InvalidOperationException("Client already has an account or is blocked.");
+            existing.UserId = user.Id;
+            // Preserve the staff-maintained identity and all existing relationships/history.
+            user.FirstName = existing.FirstName;
+            user.LastName = existing.LastName;
+            if (string.IsNullOrWhiteSpace(existing.Email)) existing.Email = invitation.Email;
+            existing.UpdatedAt = DateTime.UtcNow;
+            await _context.SaveChangesAsync();
+            return;
+        }
+        if (await _context.Clients.IncludingOrganizationArchive(_context.OrganizationId).AnyAsync(c => c.Email.ToLower() == invitation.Email.ToLower()))
+            throw new InvalidOperationException("A client now exists with this email. Cancel this invitation and invite the existing client.");
+        var client = new Client
+        {
+            UserId = user.Id,
+            TrainerId = invitation.TrainerId,
+            FirstName = request.FirstName,
+            LastName = request.LastName,
+            Email = invitation.Email,
+            LocationId = invitation.LocationId,
+            Status = "Inactive",
+            TrainingStartDate = StudioMonth.TodayAsStoredDate(DateTime.UtcNow),
+            BillingStatus = "Pending",
+            SubscriptionAutoRenewEnabled = true,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow,
+            CreatedBy = invitation.CreatedBy
+        };
+
+        await _context.Clients.AddAsync(client);
+        await _context.ClientLocationMemberships.AddAsync(new ClientLocationMembership
+        {
+            Client = client,
+            LocationId = invitation.LocationId,
+            IsHomeLocation = true,
+            GroupAccessEnabled = false,
+            Source = "Invitation",
+            JoinedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        });
+        await _context.SaveChangesAsync();
+    }
+
+    private InvitationDto MapToDto(Invitation invitation)
+    {
+        return new InvitationDto
+        {
+            Id = invitation.Id,
+            ClientId = invitation.ClientId,
+            Email = invitation.Email,
+            Role = invitation.Role,
+            LocationId = invitation.LocationId,
+            LocationName = GetLocationName(invitation),
+            TrainerId = invitation.TrainerId,
+            TrainerName = GetTrainerName(invitation),
+            Token = invitation.Token,
+            InviteLink = $"{_appSettings.FrontendBaseUrl}/accept-invitation?token={invitation.Token}",
+            ExpiresAt = invitation.ExpiresAt,
+            IsAccepted = invitation.IsAccepted,
+            AcceptedAt = invitation.AcceptedAt,
+            CancelledAt = invitation.CancelledAt,
+            LastSentAt = invitation.LastSentAt,
+            LastSendError = invitation.LastSendError,
+            CreatedAt = invitation.CreatedAt,
+            Status = GetStatus(invitation)
+        };
+    }
+
+    private async Task<Invitation?> LoadInvitationForDtoAsync(int id)
+    {
+        return await _context.Invitations
+            .Include(i => i.Location)
+            .Include(i => i.Trainer)
+                .ThenInclude(t => t!.User)
+            .FirstOrDefaultAsync(i => i.Id == id);
+    }
+
+    private async Task SendInvitationEmailAndTrackResultAsync(
+        Invitation invitation,
+        string locationName,
+        string inviteLink)
+    {
+        try
+        {
+            await _emailService.SendInvitationEmailAsync(
+                invitation.Email,
+                invitation.Role,
+                locationName,
+                inviteLink);
+
+            invitation.LastSentAt = DateTime.UtcNow;
+            invitation.LastSendError = null;
+            await _context.SaveChangesAsync();
+        }
+        catch (Exception ex)
+        {
+            invitation.LastSendError = TruncateLastSendError(ex.Message);
+            await _context.SaveChangesAsync();
+
+            throw new InvalidOperationException(
+                "Invitation was saved, but email could not be sent. Check Resend domain/API key configuration. " +
+                ex.Message);
+        }
+    }
+
+    private static string GetStatus(Invitation invitation)
+    {
+        if (invitation.IsAccepted) return "Accepted";
+        if (invitation.CancelledAt != null) return "Cancelled";
+        if (invitation.ExpiresAt <= DateTime.UtcNow) return "Expired";
+        return "Pending";
+    }
+
+    private static string GetLocationName(Invitation invitation)
+    {
+        return invitation.Location?.Name ?? string.Empty;
+    }
+
+    private static string? GetTrainerName(Invitation invitation)
+    {
+        return invitation.Trainer is null
+            ? null
+            : $"{invitation.Trainer.User.FirstName} {invitation.Trainer.User.LastName}";
+    }
+
+    private static string NormalizeEmail(string? email)
+    {
+        return (email ?? string.Empty).Trim().ToLowerInvariant();
+    }
+
+    private static string NormalizeRole(string? role)
+    {
+        var value = (role ?? string.Empty).Trim();
+
+        if (value.Equals("trainer", StringComparison.OrdinalIgnoreCase))
+            return "Trainer";
+
+        if (value.Equals("client", StringComparison.OrdinalIgnoreCase))
+            return "Client";
+
+        return value;
+    }
+
+    private static string GenerateToken()
+    {
+        var bytes = RandomNumberGenerator.GetBytes(48);
+        return Convert.ToBase64String(bytes)
+            .Replace("+", "-")
+            .Replace("/", "_")
+            .Replace("=", "");
+    }
+
+    private static string TruncateLastSendError(string message)
+    {
+        if (message.Length <= LastSendErrorMaxLength)
+            return message;
+
+        return message[..LastSendErrorMaxLength];
+    }
+}

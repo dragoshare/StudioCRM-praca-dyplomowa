@@ -1,0 +1,366 @@
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.IdentityModel.Tokens;
+using StudioCRM.Application.Interfaces;
+using StudioCRM.Application.Settings;
+using StudioCRM.Infrastructure.Persistence;
+using StudioCRM.Infrastructure.Seed;
+using StudioCRM.Infrastructure.Services;
+using System.Text;
+using Microsoft.OpenApi.Models;
+using StudioCRM.Api.Swagger;
+using System.Security.Claims;
+using Resend;
+using StudioCRM.Api.BackgroundServices;
+using StudioCRM.Application.Interfaces.Calendar;
+using StudioCRM.Application.Interfaces.Mail;
+using StudioCRM.Infrastructure.Services.Calendar;
+using StudioCRM.Infrastructure.Services.Mail;
+using StudioCRM.Infrastructure.Services.Storage;
+using StudioCRM.Application.ClientPackages.Services;
+using StudioCRM.Application.Interfaces.Storage;
+using System.Text.Json;
+
+var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddScoped<IPlatformOrganizationService, StudioCRM.Infrastructure.Services.Branding.PlatformOrganizationService>();
+builder.Services.Configure<BrandingOptions>(builder.Configuration.GetSection("Branding"));
+builder.Services.AddScoped<IBrandingProfileContext, StudioCRM.Infrastructure.Services.Branding.BrandingProfileContext>();
+builder.Services.AddScoped<StudioCRM.Infrastructure.Services.Branding.BrandingAccess>();
+builder.Services.AddScoped<IBrandingService, StudioCRM.Infrastructure.Services.Branding.BrandingService>();
+var defaultConnectionName = builder.Environment.IsDevelopment()
+    ? "TestConnection"
+    : "DefaultConnection";
+var connectionName = builder.Configuration["Database:ConnectionName"] ?? defaultConnectionName;
+
+// JWT settings
+builder.Services.Configure<JwtSettings>(
+    builder.Configuration.GetSection("Jwt"));
+
+var jwtSettings = builder.Configuration.GetSection("Jwt").Get<JwtSettings>()
+    ?? throw new InvalidOperationException("JWT settings are not configured.");
+if (string.IsNullOrWhiteSpace(jwtSettings.Key) || Encoding.UTF8.GetByteCount(jwtSettings.Key) < 32)
+{
+    throw new InvalidOperationException("JWT signing key must be configured and contain at least 32 bytes.");
+}
+
+builder.Services.Configure<AppSettings>(
+    builder.Configuration.GetSection("App"));
+builder.Services.Configure<TpaySettings>(builder.Configuration.GetSection("Tpay"));
+builder.Services.AddMemoryCache();
+builder.Services.AddSingleton<OrganizationJobRunner>();
+builder.Services.AddHttpClient<ITpayConnectionService, TpayConnectionService>(client =>
+    client.Timeout = TimeSpan.FromSeconds(20))
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
+builder.Services.AddHttpClient<ITpayApiClient, TpayConnectionService>(client =>
+    client.Timeout = TimeSpan.FromSeconds(20))
+    .ConfigurePrimaryHttpMessageHandler(() => new HttpClientHandler { AllowAutoRedirect = false });
+builder.Services.Configure<CloudflareR2Settings>(
+    builder.Configuration.GetSection("CloudflareR2"));
+// Database
+var connectionString = builder.Configuration.GetConnectionString(connectionName);
+if (string.IsNullOrWhiteSpace(connectionString))
+{
+    throw new InvalidOperationException($"Connection string '{connectionName}' is not configured.");
+}
+
+builder.Services.AddDbContext<StudioCRMDbContext>(options =>
+    options.UseNpgsql(connectionString));
+builder.Services.AddScoped<OrganizationDbContextFactory>();
+builder.Services.AddScoped<StudioCRM.Api.Security.RequestOrganizationContext>();
+builder.Services.AddScoped<StudioCRMDbContext>(sp => sp.GetRequiredService<OrganizationDbContextFactory>()
+    .Create(sp.GetRequiredService<StudioCRM.Api.Security.RequestOrganizationContext>().Freeze()));
+
+// Services
+builder.Services.AddScoped<IAuthService, AuthService>();
+builder.Services.AddScoped<ITrainerService, TrainerService>();
+builder.Services.AddScoped<ITrainerContractService, TrainerContractService>();
+builder.Services.AddScoped<IClientService, ClientService>();
+builder.Services.AddScoped<IClientEmailChangeService, ClientEmailChangeService>();
+builder.Services.AddScoped<IPackageService, PackageService>();
+builder.Services.AddScoped<ISessionService, SessionService>();
+builder.Services.AddScoped<IDashboardService, DashboardService>();
+builder.Services.AddScoped<ILocationService, LocationService>();
+builder.Services.AddScoped<ICurrentUserService, CurrentUserService>();
+builder.Services.AddScoped<IActivityLogService, ActivityLogService>();
+builder.Services.AddScoped<IInvitationService, InvitationService>();
+builder.Services.AddScoped<IClientPortalService, ClientPortalService>();
+builder.Services.AddScoped<ITrainerPortalService, TrainerPortalService>();
+builder.Services.AddScoped<IExternalCalendarEventService, ExternalCalendarEventService>();
+builder.Services.AddScoped<ISessionParticipantService, SessionParticipantService>();
+builder.Services.AddScoped<ITrainerRateService, TrainerRateService>();
+builder.Services.AddScoped<ITrainerSettlementService, TrainerSettlementService>();
+builder.Services.AddScoped<IMilestoneService, MilestoneService>();
+builder.Services.AddScoped<IClientPackageService, ClientPackageService>();
+builder.Services.AddScoped<ClientPaymentService>();
+builder.Services.AddScoped<IClientPaymentService>(sp => sp.GetRequiredService<ClientPaymentService>());
+builder.Services.AddScoped<ITpayPaymentService>(sp => sp.GetRequiredService<ClientPaymentService>());
+builder.Services.AddScoped<IPaymentConfigurationService, PaymentConfigurationService>();
+builder.Services.AddScoped<ICompanyExpenseService, CompanyExpenseService>();
+builder.Services.AddScoped<ITrainerCostAnalysisService, TrainerCostAnalysisService>();
+builder.Services.AddScoped<ISubscriptionService, SubscriptionService>();
+builder.Services.AddScoped<IOperationalAlertService, OperationalAlertService>();
+builder.Services.AddScoped<INotificationService, NotificationService>();
+builder.Services.AddScoped<IStudioSettingsService, StudioSettingsService>();
+builder.Services.AddScoped<IOutlookContactService, OutlookContactService>();
+builder.Services.AddScoped<GroupEnrollmentService>();
+builder.Services.AddScoped<ISessionAutoCompletionService, SessionAutoCompletionService>();
+builder.Services.AddScoped<IAvatarService, AvatarService>();
+builder.Services.AddScoped<IPublicGroupClassService, PublicGroupClassService>();
+builder.Services.AddHttpClient<IObjectStorageService, CloudflareR2ObjectStorageService>();
+// Authentication
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+})
+.AddJwtBearer(options =>
+{
+    StudioCRM.Api.Security.AtlasJwt.Configure(options, jwtSettings);
+});
+
+// Controllers + Swagger
+builder.Services.AddControllers();
+builder.Services.AddEndpointsApiExplorer();
+builder.Services.AddSwaggerGen(c =>
+{
+    c.SwaggerDoc("v1", new Microsoft.OpenApi.Models.OpenApiInfo
+    {
+        Title = "StudioCRM.Api",
+        Version = "v1"
+    });
+    c.SchemaFilter<StudioCRM.Api.Swagger.EnumDescriptionSchemaFilter>();
+    c.OperationFilter<StudioCRM.Api.Swagger.ListEndpointsOperationFilter>();
+
+    c.AddSecurityDefinition("Bearer", new Microsoft.OpenApi.Models.OpenApiSecurityScheme
+    {
+        Name = "Authorization",
+        Type = Microsoft.OpenApi.Models.SecuritySchemeType.Http,
+        Scheme = "bearer",
+        BearerFormat = "JWT",
+        In = Microsoft.OpenApi.Models.ParameterLocation.Header,
+        Description = "Wpisz token JWT"
+    });
+
+    c.AddSecurityRequirement(new Microsoft.OpenApi.Models.OpenApiSecurityRequirement
+    {
+        {
+            new Microsoft.OpenApi.Models.OpenApiSecurityScheme
+            {
+                Reference = new Microsoft.OpenApi.Models.OpenApiReference
+                {
+                    Type = Microsoft.OpenApi.Models.ReferenceType.SecurityScheme,
+                    Id = "Bearer"
+                }
+            },
+            Array.Empty<string>()
+        }
+    });
+});
+builder.Services.Configure<ResendSettings>(
+    builder.Configuration.GetSection("Resend"));
+
+builder.Services.Configure<EmailSettings>(
+    builder.Configuration.GetSection("Email"));
+
+builder.Services.Configure<AppSettings>(
+    builder.Configuration.GetSection("App"));
+
+builder.Services.AddOptions();
+
+builder.Services.AddHttpClient<ResendClient>();
+
+builder.Services.Configure<SessionBalanceSettings>(builder.Configuration.GetSection("SessionBalance"));
+
+builder.Services.AddOptions<OutlookSettings>()
+    .Bind(builder.Configuration.GetSection("Outlook"))
+    .Validate(settings => !settings.UseCalendarEmails || !string.IsNullOrWhiteSpace(settings.CalendarEmailDomain),
+        "Outlook:CalendarEmailDomain is required when UseCalendarEmails is enabled.")
+    .Validate(settings => string.IsNullOrWhiteSpace(settings.CalendarEmailDomain) ||
+        (settings.CalendarEmailDomain.Length <= 253 && settings.CalendarEmailDomain.Contains('.') &&
+         !settings.CalendarEmailDomain.EndsWith('.') && Uri.CheckHostName(settings.CalendarEmailDomain) == UriHostNameType.Dns),
+        "Outlook:CalendarEmailDomain must be a DNS domain, without a URL or email address.")
+    .ValidateOnStart();
+
+builder.Services.AddHttpClient<IOutlookCalendarAuthService, OutlookCalendarAuthService>();
+builder.Services.AddHttpClient<IOutlookCalendarSyncService, OutlookCalendarSyncService>();
+builder.Services.AddHttpClient<IOutlookSubscriptionService, OutlookSubscriptionService>();
+builder.Services.AddHttpClient<IOutlookWebhookService, OutlookWebhookService>();
+builder.Services.AddHttpClient<IOutlookTokenService, OutlookTokenService>();
+
+builder.Services.AddHostedService<OutlookSubscriptionRenewalWorker>();
+builder.Services.AddSingleton<StudioCRM.Api.BackgroundServices.OutlookWebhookQueue>();
+builder.Services.AddHostedService<StudioCRM.Api.BackgroundServices.OutlookWebhookWorker>();
+builder.Services.AddSingleton<StudioCRM.Api.BackgroundServices.OutlookReconcileJobs>();
+builder.Services.AddHostedService<StudioCRM.Api.BackgroundServices.OutlookReconcileWorker>();
+builder.Services.AddHostedService<StudioCRM.Api.BackgroundServices.OutlookAutoReconcileWorker>();
+builder.Services.AddSingleton<StudioCRM.Api.BackgroundServices.OutlookContactSyncQueue>();
+builder.Services.AddSingleton<IOutlookContactSyncQueue>(sp => sp.GetRequiredService<StudioCRM.Api.BackgroundServices.OutlookContactSyncQueue>());
+builder.Services.AddHostedService<StudioCRM.Api.BackgroundServices.OutlookContactSyncWorker>();
+builder.Services.AddHostedService<SessionAutoCompletionWorker>();
+builder.Services.AddScoped<PeriodPackageService>();
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddScoped<OwnerOverviewService>();
+builder.Services.AddHostedService<PeriodPackageWorker>();
+
+builder.Services.Configure<ResendClientOptions>(options =>
+{
+    options.ApiToken = builder.Configuration["Resend:ApiToken"]!;
+});
+
+builder.Services.AddTransient<IResend, ResendClient>();
+
+builder.Services.AddScoped<IEmailService, EmailService>();
+
+// Encrypts Outlook OAuth tokens at rest; without the key they are stored as before (plaintext).
+StudioCRM.Infrastructure.Persistence.TokenProtector.Configure(builder.Configuration["Security:TokenEncryptionKey"]);
+
+var app = builder.Build();
+
+if (!StudioCRM.Infrastructure.Persistence.TokenProtector.IsConfigured && !app.Environment.IsDevelopment())
+    app.Logger.LogWarning("Security:TokenEncryptionKey is not set; Outlook tokens are stored unencrypted.");
+
+app.UseMiddleware<StudioCRM.Api.Diagnostics.RequestTimingMiddleware>();
+
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        var exceptionFeature = context.Features.Get<Microsoft.AspNetCore.Diagnostics.IExceptionHandlerFeature>();
+        var exception = exceptionFeature?.Error;
+        var logger = context.RequestServices.GetRequiredService<ILogger<Program>>();
+
+        var (statusCode, message) = exception switch
+        {
+            InvalidOperationException invalidOperationException => (
+                StatusCodes.Status400BadRequest,
+                invalidOperationException.Message),
+            System.ComponentModel.DataAnnotations.ValidationException validationException => (
+                StatusCodes.Status400BadRequest, validationException.Message),
+            ArgumentException argumentException => (
+                StatusCodes.Status400BadRequest,
+                argumentException.Message),
+            UnauthorizedAccessException unauthorizedAccessException => (
+                StatusCodes.Status403Forbidden,
+                unauthorizedAccessException.Message),
+            KeyNotFoundException keyNotFoundException => (
+                StatusCodes.Status404NotFound,
+                keyNotFoundException.Message),
+            DbUpdateConcurrencyException => (
+                StatusCodes.Status409Conflict,
+                "The data was changed by another operation. Refresh and try again."),
+            DbUpdateException => (
+                StatusCodes.Status409Conflict,
+                "Database conflict. Check whether the resource is still connected with existing data."),
+            HttpRequestException httpRequestException => (
+                StatusCodes.Status502BadGateway,
+                app.Environment.IsDevelopment()
+                    ? httpRequestException.Message
+                    : "External service request failed."),
+            _ => (
+                StatusCodes.Status500InternalServerError,
+                app.Environment.IsDevelopment()
+                    ? exception?.Message ?? "Unexpected server error."
+                    : "Unexpected server error.")
+        };
+
+        context.Response.ContentType = "application/json";
+        context.Response.StatusCode = statusCode;
+
+        if (exception is not null && statusCode >= StatusCodes.Status500InternalServerError)
+        {
+            logger.LogError(exception, "Unhandled request exception.");
+        }
+        else if (exception is not null)
+        {
+            logger.LogWarning(exception, "Handled request exception returned {StatusCode}.", statusCode);
+        }
+
+        // Business rejections with a stable code keep it: { message, code }.
+        await context.Response.WriteAsync(JsonSerializer.Serialize(
+            new { message, code = exception is null ? null : StudioCRM.Application.Common.CodedInvalidOperationException.CodeOf(exception) }));
+    });
+});
+
+// Swagger
+
+    app.UseSwagger();
+    app.UseSwaggerUI();
+
+
+app.UseHttpsRedirection();
+
+app.UseAuthentication();
+app.UseAuthorization();
+app.UseMiddleware<StudioCRM.Api.Security.OrganizationCapabilityMiddleware>();
+
+app.MapMethods("/health", new[] { "GET", "HEAD" }, () => Results.Ok(new
+{
+    status = "ok",
+    utcNow = DateTime.UtcNow
+}));
+
+app.MapMethods(
+    "/api/workers/session-auto-completion/keepalive",
+    new[] { "GET", "HEAD" },
+    async (
+        ISessionAutoCompletionService sessionAutoCompletionService,
+        HttpContext context, IConfiguration configuration,
+        CancellationToken cancellationToken) =>
+    {
+        if (!StudioCRM.Api.Security.WorkerRequestAccess.CanExecute(context, configuration))
+            return Results.Ok(new { message = "Service awake; completion is handled by the background worker.", executed = false,
+                completed = 0, skipped = 0, failed = 0, utcNow = DateTime.UtcNow });
+        var result = await sessionAutoCompletionService.CompleteFinishedSessionsAsync(cancellationToken);
+        var response = new
+        {
+            message = "Session auto-completion checked",
+            completed = result.CompletedCount,
+            skipped = result.SkippedCount,
+            failed = result.FailedCount,
+            utcNow = DateTime.UtcNow
+        };
+
+        return result.FailedCount > 0
+            ? Results.Json(response, statusCode: StatusCodes.Status500InternalServerError)
+            : Results.Ok(response);
+    });
+
+app.MapControllers();
+
+// Seeder
+using (var scope = app.Services.CreateScope())
+{
+    var dbContext = scope.ServiceProvider.GetRequiredService<StudioCRMDbContext>();
+    var applyMigrationsOnStartup = builder.Configuration.GetValue<bool>("Database:ApplyMigrationsOnStartup");
+    if (applyMigrationsOnStartup)
+    {
+        await dbContext.Database.MigrateAsync();
+    }
+    else
+    {
+        var pendingMigrations = (await dbContext.Database.GetPendingMigrationsAsync()).ToList();
+        if (pendingMigrations.Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"Database has {pendingMigrations.Count} pending migration(s). Run the controlled migration step before starting the API.");
+        }
+    }
+
+    var seedDemoData = builder.Configuration.GetValue<bool>("Seed:DemoData") &&
+                       builder.Configuration["Seed:DemoDataConfirmation"] == "ALLOW_DEMO_SEED";
+
+    await DataSeeder.SeedAsync(dbContext, seedDemoData);
+
+    // Database round-trip from this host (one simple query after the connection is warm).
+    var roundTrips = new List<double>();
+    for (var i = 0; i < 5; i++)
+    {
+        var probe = System.Diagnostics.Stopwatch.StartNew();
+        await dbContext.Database.ExecuteSqlRawAsync("SELECT 1");
+        roundTrips.Add(probe.Elapsed.TotalMilliseconds);
+    }
+    app.Logger.LogInformation("Database round-trip: first {FirstMs:0} ms, then min {MinMs:0} ms / avg {AvgMs:0} ms",
+        roundTrips[0], roundTrips.Skip(1).Min(), roundTrips.Skip(1).Average());
+}
+app.Run();

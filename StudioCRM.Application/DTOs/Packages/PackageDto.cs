@@ -1,0 +1,34 @@
+using StudioCRM.Domain.Enums;
+
+namespace StudioCRM.Application.DTOs.Packages;
+
+public class PackageDto
+{
+    public StudioCRM.Domain.Enums.PackageBillingMode BillingMode { get; set; } = StudioCRM.Domain.Enums.PackageBillingMode.SessionBased;
+
+    public int Id { get; set; }
+
+    public string Name { get; set; } = string.Empty;
+    public string? Description { get; set; }
+    public decimal Price { get; set; }
+    public string Currency { get; set; } = string.Empty;
+    public int SessionsLimit { get; set; }
+    public int SessionsPerWeek { get; set; }
+    public int DurationDays { get; set; }
+    public SessionBillingType BillingType { get; set; }
+    public string PackageType => BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? "PeriodBased" : StudioCRM.Application.Common.PackageTypeMapper.FromBillingType(BillingType);
+    public int ParticipantsCount { get; set; }
+    public int? LocationId { get; set; }
+    public string? LocationName { get; set; }
+    public bool IsPubliclyAvailable { get; set; }
+    public string? PublicSlug { get; set; }
+    public bool IsActive { get; set; }
+    /// <summary>Pakiet „Wspierający” (rozpoznawany po nazwie); na listach wyboru jest w osobnej sekcji na końcu.</summary>
+    public bool IsSupporting { get; set; }
+    /// <summary>Pakiet hybrydowy (rozpoznawany po nazwie); na listach wyboru wszystkie hybrydowe są obok siebie, po treningach na wejścia.</summary>
+    public bool IsHybrid { get; set; }
+
+    public DateTime CreatedAt { get; set; }
+    public DateTime UpdatedAt { get; set; }
+    public int? CreatedBy { get; set; }
+}

@@ -1,0 +1,28 @@
+using StudioCRM.Application.DTOs.Billing;
+
+namespace StudioCRM.Application.Interfaces;
+
+public interface IClientPaymentService
+{
+    Task<ClientBillingTotalsDto> GetClientTotalsAsync(int clientId);
+    Task<PagedResultDto<ClientPaymentDto>> GetPendingPageAsync(ClientPaymentFilterDto filter);
+    Task<ClientBillingSummaryDto> GetCurrentClientSummaryAsync();
+    Task<ClientBillingSummaryDto> GetClientSummaryAsync(int clientId);
+    Task<PagedResultDto<ClientPaymentDto>> GetPaymentsAsync(ClientPaymentFilterDto filter);
+    Task<RevenueStatisticsDto> GetRevenueStatisticsAsync(RevenueAnalysisFilterDto filter);
+    Task<PagedResultDto<ClientPaymentDto>> GetClientPaymentsAsync(int clientId, ClientPaymentFilterDto filter);
+    Task<PagedResultDto<ClientBalanceTransactionDto>> GetClientBalanceTransactionsAsync(int clientId, int page, int pageSize);
+    Task<ClientPackageBillingDto?> GetActivePackageAsync(int clientId);
+    Task<List<ClientPaymentDto>> GetPendingConfirmationsAsync();
+    Task<List<ClientPaymentDto>> GetPendingReceiptsAsync();
+    Task<ClientPaymentDto> RequestPaymentAsClientAsync(CreateClientPaymentRequest request);
+    Task<ClientPaymentDto> CreatePaymentAsStaffAsync(CreateClientPaymentRequest request);
+    Task<PaymentOperationStatusDto?> GetStaffPaymentOperationAsync(Guid key);
+    Task<ClientPaymentDto> UpdatePaymentDateAsync(int paymentId, UpdatePaymentDateRequest request);
+    Task<ClientPaymentDto> ConfirmAsync(int paymentId);
+    Task<ClientPaymentDto> UpdateProviderSettlementAsync(int paymentId, UpdatePaymentProviderSettlementRequest request);
+    Task<ClientPaymentDto> RejectAsync(int paymentId, RejectClientPaymentRequest request);
+    Task<ClientPaymentDto> IssueReceiptAsync(int paymentId, IssueReceiptRequest request);
+    Task<ClientPaymentDto> CancelReceiptAsync(int paymentId);
+    Task<ClientPaymentDto> ReverseAsync(int paymentId, ReverseClientPaymentRequest request);
+}

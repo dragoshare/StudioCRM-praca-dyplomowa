@@ -1,0 +1,21 @@
+using StudioCRM.Application.DTOs.Auth;
+
+using StudioCRM.Application.DTOs.Public;
+
+namespace StudioCRM.Application.Interfaces;
+
+public interface IAuthService
+{
+    Task<CreatedAccountDto> RegisterAsync(RegisterDto request);
+    Task<AuthResponseDto> RegisterPublicGroupClientAsync(PublicGroupRegisterRequest request);
+    Task<AuthResponseDto?> LoginAsync(LoginRequestDto request);
+    Task<AuthMeDto?> GetMeAsync(int userId);
+    Task<UserOrganizationPageDto> GetOrganizationsAsync(int userId, int page, int pageSize);
+    Task<AuthResponseDto> RefreshAsync(RefreshTokenRequestDto request);
+    Task LogoutAsync(int userId);
+    Task ForgotPasswordAsync(ForgotPasswordDto request);
+    Task ResetPasswordAsync(ResetPasswordDto request);
+    Task ChangePasswordAsync(int userId, ChangePasswordDto request);
+    Task VerifyEmailAsync(VerifyEmailRequest request);
+    Task ResendEmailVerificationAsync(ResendEmailVerificationRequest request);
+}

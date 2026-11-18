@@ -1,0 +1,638 @@
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Logging;
+using StudioCRM.Application.Common;
+using StudioCRM.Application.DTOs.SessionParticipants;
+using StudioCRM.Application.Interfaces;
+using StudioCRM.Application.Interfaces.Calendar;
+using StudioCRM.Domain.Entities;
+using StudioCRM.Domain.Enums;
+using StudioCRM.Infrastructure.Persistence;
+using StudioCRM.Application.Settings;
+using Microsoft.Extensions.Options;
+
+namespace StudioCRM.Infrastructure.Services;
+
+public class SessionParticipantService : ISessionParticipantService
+{
+    private readonly StudioCRMDbContext _context;
+    private readonly ICurrentUserService _currentUser;
+    private readonly ISubscriptionService _subscriptionService;
+    private readonly IOutlookCalendarSyncService _outlookCalendarSyncService;
+    private readonly ILogger<SessionParticipantService> _logger;
+
+    private readonly SessionBalanceSettings _balanceSettings;
+
+    public SessionParticipantService(
+        StudioCRMDbContext context,
+        ICurrentUserService currentUser,
+        ISubscriptionService subscriptionService,
+        IOutlookCalendarSyncService outlookCalendarSyncService,
+        ILogger<SessionParticipantService> logger,
+        IOptions<SessionBalanceSettings>? balanceSettings = null)
+    {
+        _balanceSettings = balanceSettings?.Value ?? new SessionBalanceSettings();
+        _context = context;
+        _currentUser = currentUser;
+        _subscriptionService = subscriptionService;
+        _outlookCalendarSyncService = outlookCalendarSyncService;
+        _logger = logger;
+    }
+
+    public async Task<List<SessionParticipantDto>> GetBySessionIdAsync(int sessionId)
+    {
+        var session = await _context.Sessions.FirstOrDefaultAsync(s => s.Id == sessionId)
+            ?? throw new KeyNotFoundException("Session not found.");
+        await EnsureCurrentUserCanManageSessionAsync(session);
+        return await _context.SessionParticipants
+            .Include(sp => sp.Client)
+            .Include(sp => sp.Package)
+            .Where(sp => sp.SessionId == sessionId)
+            .OrderBy(sp => sp.Client.LastName)
+            .ThenBy(sp => sp.Client.FirstName)
+            .Select(sp => new SessionParticipantDto
+            {
+                Id = sp.Id,
+                SessionId = sp.SessionId,
+                ClientId = sp.ClientId,
+                ClientFullName = sp.Client.FirstName + " " + sp.Client.LastName,
+                PackageId = sp.PackageId,
+                PackageName = sp.Package != null ? sp.Package.Name : null,
+                AttendanceStatus = sp.AttendanceStatus,
+                CountsAgainstPackage = sp.CountsAgainstPackage,
+                SessionsCharged = sp.SessionsCharged,
+                Note = sp.Note
+            })
+            .ToListAsync();
+    }
+
+    public async Task<SessionParticipantDto> AddParticipantAsync(int sessionId, AddSessionParticipantDto request)
+    {
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        await SessionWriteLock.AcquireAsync(_context, sessionId, [request.ClientId]);
+        var session = await _context.Sessions.FirstOrDefaultAsync(s => s.Id == sessionId);
+
+        if (session is null)
+            throw new InvalidOperationException("Session does not exist.");
+
+        await EnsureCurrentUserCanManageSessionAsync(session);
+
+        if (session.Status == "Completed")
+            throw new InvalidOperationException("Cannot add participant to completed session.");
+
+        var client = await _context.Clients.FirstOrDefaultAsync(c => c.Id == request.ClientId);
+
+        if (client is null)
+            throw new InvalidOperationException("Client does not exist.");
+
+        await EnsureClientAllowedAsync(session, client.Id);
+        if (session.Status == "Cancelled") throw new InvalidOperationException("Cannot add participant to cancelled session.");
+        if (session.PublicCapacity.HasValue && await _context.SessionParticipants.CountAsync(p => p.SessionId == sessionId &&
+            p.AttendanceStatus != "CancelledInTime" && p.AttendanceStatus != "CancelledLate") >= session.PublicCapacity.Value)
+            throw new InvalidOperationException("Session capacity has been reached.");
+
+        if (GroupBookingPolicy.IsGroup(session))
+            GroupBookingPolicy.EnsureRegistrationOpen(session, DateTime.UtcNow);
+        var alreadyExists = await _context.SessionParticipants
+            .AnyAsync(sp => sp.SessionId == sessionId && sp.ClientId == request.ClientId);
+
+        if (alreadyExists)
+            throw new InvalidOperationException("Client is already assigned to this session.");
+
+        var activeClientPackage = await PackageBookingEligibility.ResolveAsync(_context, client.Id, session, NormalizeSessionsCharged(request.SessionsCharged), request.ClientPackageId);
+        if (GroupBookingPolicy.IsGroup(session) && activeClientPackage == null)
+            throw new InvalidOperationException("A paid, valid group package with an available entry is required. Use the payment preparation flow.");
+        var sessionsCharged = NormalizeSessionsCharged(request.SessionsCharged);
+
+        var participant = new SessionParticipant
+        {
+            SessionId = sessionId,
+            ClientId = client.Id,
+            PackageId = activeClientPackage?.PackageId,
+            ClientPackageId = activeClientPackage?.Id,
+            AttendanceStatus = "Planned",
+            CountsAgainstPackage = GroupBookingPolicy.IsGroup(session) || request.CountsAgainstPackage,
+            SessionsCharged = sessionsCharged,
+            PlannedBillingType = activeClientPackage?.ExpectedBillingType,
+            ExpectedUnitPrice = activeClientPackage?.ExpectedUnitPrice,
+            Note = request.Note,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow
+        };
+
+        await _context.SessionParticipants.AddAsync(participant);
+        PersonalSessionType.FollowParticipants(session, await CountActiveParticipantsAsync(sessionId) + 1);
+
+        session.UpdatedAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync();
+
+        await transaction.CommitAsync();
+        await TrySyncSessionToOutlookAsync(sessionId);
+
+        return await MapParticipantAsync(participant.Id);
+    }
+
+    public async Task<bool> RemoveParticipantAsync(int sessionId, int participantId)
+    {
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        await SessionWriteLock.AcquireAsync(_context, sessionId);
+        var participant = await _context.SessionParticipants
+            .Include(sp => sp.Session)
+            .FirstOrDefaultAsync(sp => sp.Id == participantId && sp.SessionId == sessionId);
+
+        if (participant is null)
+            return false;
+
+        await EnsureCurrentUserCanManageSessionAsync(participant.Session);
+
+        if (participant.Session.Status == "Completed")
+            throw new InvalidOperationException("Cannot remove participant from completed session.");
+
+        _context.SessionParticipants.Remove(participant);
+        PersonalSessionType.FollowParticipants(participant.Session,
+            await CountActiveParticipantsAsync(sessionId, excludedParticipantId: participant.Id));
+        await _context.SaveChangesAsync();
+        await transaction.CommitAsync();
+
+        await TrySyncSessionToOutlookAsync(sessionId);
+
+        return true;
+    }
+
+    public async Task<bool> CompleteSessionAsync(int sessionId, CompleteSessionDto request)
+    {
+        return await CompleteSessionInTransactionAsync(sessionId, request, skipUserAccessCheck: false);
+    }
+
+    public async Task<bool> CompleteSessionAutomaticallyAsync(int sessionId, CompleteSessionDto request)
+    {
+        return await CompleteSessionInTransactionAsync(sessionId, request, skipUserAccessCheck: true);
+    }
+
+    private async Task<bool> CompleteSessionInTransactionAsync(
+        int sessionId,
+        CompleteSessionDto request,
+        bool skipUserAccessCheck)
+    {
+        if (_context.Database.CurrentTransaction is not null)
+            return await CompleteSessionCoreAsync(sessionId, request, skipUserAccessCheck);
+
+        await using var transaction = await _context.Database.BeginTransactionAsync();
+        try
+        {
+            await SessionWriteLock.AcquireAsync(_context, sessionId, request.Participants.Select(p => p.ClientId));
+            var result = await CompleteSessionCoreAsync(sessionId, request, skipUserAccessCheck);
+            await transaction.CommitAsync();
+            // Outlook only after the commit: an event update e-mails every attendee, so it must never be sent for a
+            // completion that may still roll back and be retried by the worker. The automatic completion changes
+            // nothing an attendee sees, so it does not touch Outlook at all.
+            if (result && !skipUserAccessCheck)
+                await TrySyncSessionToOutlookAsync(sessionId);
+            return result;
+        }
+        catch
+        {
+            try
+            {
+                await transaction.RollbackAsync();
+            }
+            finally
+            {
+                // A database rollback does not undo tracked mutations. The auto-completion
+                // batch reuses this context, so discard failed work before another session saves.
+                _context.ChangeTracker.Clear();
+            }
+            throw;
+        }
+    }
+
+    private Task<int> CountActiveParticipantsAsync(int sessionId, int? excludedParticipantId = null) =>
+        _context.SessionParticipants.CountAsync(p =>
+            p.SessionId == sessionId && p.Id != excludedParticipantId &&
+            p.AttendanceStatus != "CancelledInTime" && p.AttendanceStatus != "CancelledLate");
+
+    private async Task EnsureClientAllowedAsync(Session session, int clientId)
+    {
+        if (_currentUser.IsOwner) return;
+        var group = session.IsPubliclyBookable || session.PlannedSessionType == "Group";
+        if (!await _context.Clients.AnyAsync(c => c.Id == clientId &&
+            (c.Trainer != null && c.Trainer.UserId == _currentUser.UserId || group && c.LocationMemberships.Any(m =>
+                m.LocationId == session.LocationId && m.GroupAccessEnabled))))
+            throw new InvalidOperationException("Client is not accessible for this session.");
+    }
+
+    private async Task<bool> CompleteSessionCoreAsync(
+        int sessionId,
+        CompleteSessionDto request,
+        bool skipUserAccessCheck)
+    {
+        var session = await _context.Sessions
+            .Include(s => s.Participants)
+            .FirstOrDefaultAsync(s => s.Id == sessionId);
+
+        if (session is null)
+            return false;
+
+        if (!skipUserAccessCheck)
+        {
+            await EnsureCurrentUserCanManageSessionAsync(session);
+        }
+
+        // The automatic worker must not turn a concurrently completed session into a correction.
+        if (skipUserAccessCheck && session.Status == "Completed") return true;
+
+        if (ConsultationSessions.IsConsultation(session.PlannedSessionType))
+        {
+            // Trainer work time only: no clients, entries or balance; the settlement pays it at the hourly rate.
+            if (request.Participants.Count > 0 || session.Participants.Count > 0)
+                throw new InvalidOperationException("A consultation has no participants.");
+            if (session.Status == "Cancelled")
+                throw new InvalidOperationException("Cancelled session cannot be completed.");
+            await EnsureSessionIsNotLockedByPaidSettlementAsync(session.TrainerId, session.StartAt);
+            session.Status = "Completed";
+            session.ActualSessionType = ConsultationSessions.SessionType;
+            session.ActualParticipantsCount = 0;
+            session.CompletedAt ??= DateTime.UtcNow;
+            session.AutoCompletionFailedAt = null;
+            session.AutoCompletionError = null;
+            session.UpdatedAt = DateTime.UtcNow;
+            await _context.SaveChangesAsync();
+            return true;
+        }
+        if (request.Participants.Select(p => p.ClientId).Distinct().Count() != request.Participants.Count)
+            throw new InvalidOperationException("Duplicate participants are not allowed.");
+        if (!skipUserAccessCheck)
+            foreach (var id in request.Participants.Select(p => p.ClientId).Except(session.Participants.Select(p => p.ClientId)))
+                await EnsureClientAllowedAsync(session, id);
+
+        await EnsureSessionIsNotLockedByPaidSettlementAsync(session.TrainerId, session.StartAt);
+
+        if (session.Status == "Cancelled")
+            throw new InvalidOperationException("Cancelled session cannot be completed.");
+
+        // A group class may be completed with nobody enrolled in CRM (e.g. bookings kept elsewhere):
+        // no entries are charged and the trainer is paid the group rate.
+        if (!request.Participants.Any() && !GroupBookingPolicy.IsGroup(session))
+            throw new InvalidOperationException("At least one participant is required.");
+
+        if (!Enum.TryParse<SessionBillingType>(request.ActualSessionType, out var actualBillingType))
+            throw new InvalidOperationException("Invalid actual session type.");
+
+        if (!Enum.IsDefined(actualBillingType) ||
+            GroupBookingPolicy.IsGroup(session) != (actualBillingType == SessionBillingType.Group))
+            throw new InvalidOperationException("Group and personal sessions must be accounted separately.");
+
+        var updatesCompletedSession =
+            session.Status == "Completed" ||
+            session.Participants.Any(p => p.IsCountedFromPackage);
+        var correctionBefore = updatesCompletedSession
+            ? await SessionCorrectionRecorder.CaptureAsync(_context, session.Id)
+            : null;
+
+        var keptSettledClientIds = new HashSet<int>();
+        if (updatesCompletedSession)
+        {
+            var addsParticipantsOnly = IsAdditionOnlyCorrection(session, request);
+            try
+            {
+                await RevertSessionPackageAccountingAsync(session);
+            }
+            catch (CodedInvalidOperationException) when (addsParticipantsOnly)
+            {
+                // Rozliczenia dotychczasowych uczestników nie da się cofnąć (np. zamknięty pakiet lub wykorzystane odnowienie).
+                // Przy samym dopisaniu osób zostawiamy ich rozliczenie bez zmian i rozliczamy tylko dopisanych.
+                keptSettledClientIds = session.Participants.Select(p => p.ClientId).ToHashSet();
+            }
+
+            var requestedClientIds = request.Participants
+                .Select(p => p.ClientId)
+                .ToHashSet();
+
+            var participantsToRemove = session.Participants
+                .Where(p => !requestedClientIds.Contains(p.ClientId))
+                .ToList();
+
+            _context.SessionParticipants.RemoveRange(participantsToRemove);
+        }
+
+        var completedPackageIds = new HashSet<int>();
+
+        foreach (var participantRequest in request.Participants)
+        {
+            if (keptSettledClientIds.Contains(participantRequest.ClientId))
+                continue;
+
+            var client = await _context.Clients
+                .FirstOrDefaultAsync(c => c.Id == participantRequest.ClientId);
+
+            if (client is null)
+                throw new InvalidOperationException($"Client {participantRequest.ClientId} does not exist.");
+
+            var participant = await _context.SessionParticipants
+                .FirstOrDefaultAsync(sp =>
+                    sp.SessionId == sessionId &&
+                    sp.ClientId == participantRequest.ClientId);
+
+            if (participant is null)
+            {
+                participant = new SessionParticipant
+                {
+                    SessionId = sessionId,
+                    ClientId = client.Id,
+                    CreatedAt = DateTime.UtcNow
+                };
+
+                await _context.SessionParticipants.AddAsync(participant);
+            }
+
+            var requestedSessionsCharged = NormalizeSessionsCharged(participantRequest.SessionsCharged);
+
+            participant.AttendanceStatus = participantRequest.AttendanceStatus;
+            participant.CountsAgainstPackage = participantRequest.CountsAgainstPackage;
+            participant.SessionsCharged = requestedSessionsCharged;
+            participant.Note = participantRequest.Note;
+
+            if (participantRequest.CountsAgainstPackage && participantRequest.AttendanceStatus == "Present")
+            {
+                var activeClientPackage = await _context.ClientPackages
+                    .Where(cp =>
+                        cp.ClientId == client.Id &&
+                        cp.IsActive && cp.ClosureDisposition == null &&
+                        (cp.ValidUntil == null || cp.ValidUntil >= session.StartAt) &&
+                        (actualBillingType != SessionBillingType.Group || cp.PaymentStatus == PaymentStatus.Paid) &&
+                        (actualBillingType == SessionBillingType.Group
+                            ? cp.ExpectedBillingType == SessionBillingType.Group
+                            : (cp.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.SessionBased && cp.ExpectedBillingType != SessionBillingType.Group)) &&
+                        // A personal/semi package from another location still pays for an occasional visit there;
+                        // group packages stay bound to their location.
+                        (actualBillingType != SessionBillingType.Group || cp.LocationId == null || cp.LocationId == session.LocationId))
+                    .OrderByDescending(cp => cp.Id == participant.ClientPackageId)
+                    .ThenByDescending(cp => cp.LocationId == null || cp.LocationId == session.LocationId)
+                    .ThenByDescending(cp => cp.PurchaseDate)
+                    .FirstOrDefaultAsync();
+
+                if (activeClientPackage is not null)
+                {
+                    var usedSessions = await _context.SessionParticipants
+                        .Where(p =>
+                            p.ClientPackageId == activeClientPackage.Id &&
+                            p.IsCountedFromPackage &&
+                            p.SessionId != session.Id)
+                        .SumAsync(p => p.SessionsCharged);
+
+                    var sessionsCharged = requestedSessionsCharged;
+                    // Previous accounting of this session was reverted above; the stored counter keeps opening entries of imported packages.
+                    var newUsedSessions = Math.Max(usedSessions, activeClientPackage.UsedSessions) + sessionsCharged;
+                    await AgreedPackageAccounting.ValidateAsync(
+                        _context, activeClientPackage, actualBillingType, session.Id, sessionsCharged);
+
+                    if (newUsedSessions > activeClientPackage.TotalSessions)
+                        throw SessionPackageRejection.NoRemainingSessions(client, activeClientPackage, sessionsCharged);
+
+                    var expectedUnitPrice = activeClientPackage.ExpectedUnitPrice;
+                    var perSessionDifference = SessionBalancePolicy.PerSession(activeClientPackage, actualBillingType,
+                        _balanceSettings.OneToOneLevel(activeClientPackage.LocationId ?? session.LocationId));
+                    var actualUnitPrice = expectedUnitPrice - perSessionDifference;
+                    var balanceDifference = perSessionDifference * sessionsCharged;
+
+                    participant.PackageId = activeClientPackage.PackageId;
+                    participant.ClientPackageId = activeClientPackage.Id;
+                    participant.SessionsCharged = sessionsCharged;
+                    participant.PlannedBillingType = activeClientPackage.ExpectedBillingType;
+                    participant.ActualBillingType = actualBillingType;
+                    participant.ExpectedUnitPrice = expectedUnitPrice;
+                    participant.ActualUnitPrice = actualUnitPrice;
+                    participant.BalanceDifference = balanceDifference;
+                    participant.IsCountedFromPackage = true;
+
+                    var existingTransaction = await _context.ClientBalanceTransactions
+                        .FirstOrDefaultAsync(t =>
+                            t.ClientPackageId == activeClientPackage.Id &&
+                            t.SessionId == session.Id &&
+                            t.ClientId == activeClientPackage.ClientId &&
+                            t.Type == BalanceTransactionType.PackageAdjustment);
+
+                    if (existingTransaction is not null)
+                    {
+                        _context.ClientBalanceTransactions.Remove(existingTransaction);
+                    }
+
+                    if (balanceDifference != 0)
+                    {
+                        await _context.ClientBalanceTransactions.AddAsync(new ClientBalanceTransaction
+                        {
+                            ClientId = activeClientPackage.ClientId,
+                            ClientPackageId = activeClientPackage.Id,
+                            SessionId = session.Id,
+                            Amount = balanceDifference,
+                            Type = BalanceTransactionType.PackageAdjustment,
+                            Description = balanceDifference > 0
+                                ? $"Nadpłata: sesja rozliczona taniej niż pakiet ({actualBillingType} zamiast {activeClientPackage.ExpectedBillingType})."
+                                : $"Dopłata: sesja rozliczona drożej niż pakiet ({actualBillingType} zamiast {activeClientPackage.ExpectedBillingType}).",
+                            CreatedAt = DateTime.UtcNow
+                        });
+                    }
+
+                    activeClientPackage.UsedSessions = newUsedSessions;
+
+                    if (newUsedSessions >= activeClientPackage.TotalSessions)
+                        completedPackageIds.Add(activeClientPackage.Id);
+                }
+                else
+                {
+                    throw await SessionPackageRejection.NoUsablePackageAsync(_context, client, session, actualBillingType);
+                }
+            }
+            else
+            {
+                participant.CountsAgainstPackage = false;
+                participant.IsCountedFromPackage = false;
+                participant.ClientPackageId = null;
+                participant.PackageId = null;
+                participant.PlannedBillingType = null;
+                participant.ActualBillingType = null;
+                participant.ExpectedUnitPrice = null;
+                participant.ActualUnitPrice = null;
+                participant.BalanceDifference = null;
+            }
+
+            participant.UpdatedAt = DateTime.UtcNow;
+        }
+
+        var presentCount = request.Participants
+            .Count(p => p.AttendanceStatus == "Present");
+
+        session.Status = "Completed";
+        session.ActualSessionType = request.ActualSessionType;
+        session.ActualParticipantsCount = presentCount;
+        session.CompletedAt = DateTime.UtcNow;
+        session.AutoCompletionFailedAt = null;
+        session.AutoCompletionError = null;
+        session.UpdatedAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync();
+
+        foreach (var clientPackageId in completedPackageIds)
+        {
+            await _subscriptionService.RenewAfterCompletedCycleAsync(clientPackageId);
+        }
+
+        if (correctionBefore is not null)
+        {
+            await _context.SaveChangesAsync();
+            await SessionCorrectionRecorder.RecordAsync(
+                _context,
+                session.Id,
+                "SessionRecalculated",
+                request.CorrectionReason,
+                correctionBefore,
+                _currentUser.UserId);
+            await _context.SaveChangesAsync();
+        }
+
+        return true;
+    }
+
+    private async Task TrySyncSessionToOutlookAsync(int sessionId)
+    {
+        if (_context.OrganizationId != StudioCRMDbContext.LegacyOrganizationId) return;
+        try
+        {
+            await _outlookCalendarSyncService.SyncSessionAsync(sessionId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not sync session {SessionId} participants to Outlook.", sessionId);
+        }
+    }
+
+    private async Task EnsureSessionIsNotLockedByPaidSettlementAsync(int trainerId, DateTime startAt)
+    {
+        var (year, month) = GetStudioYearMonth(startAt);
+
+        var isPaid = await _context.TrainerMonthlySettlements.AnyAsync(s =>
+            s.TrainerId == trainerId &&
+            s.Year == year &&
+            s.Month == month &&
+            s.IsPaid);
+
+        if (isPaid)
+        {
+            throw new InvalidOperationException(
+                "Session cannot be changed because the trainer settlement for this month has already been paid.");
+        }
+    }
+
+    private async Task EnsureCurrentUserCanManageSessionAsync(Session session)
+    {
+        if (_currentUser.IsOwner)
+            return;
+
+        if (!_currentUser.IsTrainer || !_currentUser.UserId.HasValue)
+            throw new InvalidOperationException("Current user cannot manage this session.");
+
+        var ownsSession = await _context.Trainers
+            .AnyAsync(t => t.Id == session.TrainerId && t.UserId == _currentUser.UserId.Value);
+
+        if (!ownsSession)
+            throw new InvalidOperationException("Trainer can manage only their own sessions.");
+    }
+
+    // Korekta zakończonej sesji, która tylko dopisuje uczestników: każdy dotychczasowy uczestnik zostaje
+    // z tą samą obecnością, naliczaniem i liczbą wejść.
+    internal static bool IsAdditionOnlyCorrection(Session session, CompleteSessionDto request)
+    {
+        var requested = request.Participants.ToDictionary(p => p.ClientId);
+        return requested.Count > session.Participants.Count &&
+            session.Participants.All(existing =>
+                requested.TryGetValue(existing.ClientId, out var r) &&
+                r.AttendanceStatus == existing.AttendanceStatus &&
+                r.CountsAgainstPackage == existing.CountsAgainstPackage &&
+                NormalizeSessionsCharged(r.SessionsCharged) == existing.SessionsCharged);
+    }
+
+    private async Task RevertSessionPackageAccountingAsync(Session session)
+    {
+        await SessionAccountingCorrectionManager.RevertAsync(_context, session);
+    }
+
+    private async Task<ClientPackage?> ResolveActiveClientPackageAsync(
+        int clientId,
+        string? plannedSessionType,
+        int sessionLocationId)
+    {
+        var isGroupSession = string.Equals(
+            plannedSessionType,
+            SessionBillingType.Group.ToString(),
+            StringComparison.OrdinalIgnoreCase);
+
+        return await _context.ClientPackages
+            .Where(cp =>
+                cp.ClientId == clientId &&
+                cp.IsActive &&
+                (isGroupSession
+                    ? cp.ExpectedBillingType == SessionBillingType.Group
+                    : (cp.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.SessionBased && cp.ExpectedBillingType != SessionBillingType.Group)) &&
+                (!isGroupSession || cp.LocationId == null || cp.LocationId == sessionLocationId))
+            .OrderByDescending(cp => cp.LocationId == null || cp.LocationId == sessionLocationId)
+            .ThenByDescending(cp => cp.PurchaseDate)
+            .FirstOrDefaultAsync();
+    }
+
+    private static int NormalizeSessionsCharged(int value)
+    {
+        return Math.Max(1, value);
+    }
+
+    private static (int Year, int Month) GetStudioYearMonth(DateTime value)
+    {
+        var utc = value.Kind == DateTimeKind.Utc
+            ? value
+            : DateTime.SpecifyKind(value, DateTimeKind.Utc);
+
+        var local = TimeZoneInfo.ConvertTimeFromUtc(utc, GetStudioTimeZone());
+        return (local.Year, local.Month);
+    }
+
+    private static TimeZoneInfo GetStudioTimeZone()
+    {
+        foreach (var id in new[] { "Europe/Warsaw", "Central European Standard Time" })
+        {
+            try
+            {
+                return TimeZoneInfo.FindSystemTimeZoneById(id);
+            }
+            catch (TimeZoneNotFoundException)
+            {
+            }
+            catch (InvalidTimeZoneException)
+            {
+            }
+        }
+
+        return TimeZoneInfo.Utc;
+    }
+
+    private async Task<SessionParticipantDto> MapParticipantAsync(int participantId)
+    {
+        return await _context.SessionParticipants
+            .Include(sp => sp.Client)
+            .Include(sp => sp.Package)
+            .Where(sp => sp.Id == participantId)
+            .Select(sp => new SessionParticipantDto
+            {
+                Id = sp.Id,
+                SessionId = sp.SessionId,
+                ClientId = sp.ClientId,
+                ClientFullName = sp.Client.FirstName + " " + sp.Client.LastName,
+                PackageId = sp.PackageId,
+                PackageName = sp.Package != null ? sp.Package.Name : null,
+                AttendanceStatus = sp.AttendanceStatus,
+                CountsAgainstPackage = sp.CountsAgainstPackage,
+                SessionsCharged = sp.SessionsCharged,
+                Note = sp.Note
+            })
+            .FirstAsync();
+    }
+}
+

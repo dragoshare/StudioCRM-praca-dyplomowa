@@ -1,0 +1,375 @@
+using Microsoft.EntityFrameworkCore;
+using StudioCRM.Application.DTOs.Clients;
+using StudioCRM.Application.DTOs.Packages;
+using StudioCRM.Application.Interfaces;
+using StudioCRM.Domain.Entities;
+using StudioCRM.Infrastructure.Persistence;
+
+namespace StudioCRM.Infrastructure.Services;
+
+public class PackageService : IPackageService
+{
+    private readonly StudioCRMDbContext _context;
+    private readonly ICurrentUserService _currentUser;
+
+    public PackageService(
+        StudioCRMDbContext context,
+        ICurrentUserService currentUser)
+    {
+        _context = context;
+        _currentUser = currentUser;
+    }
+
+    public async Task<StudioCRM.Application.DTOs.Billing.PagedResultDto<PackageOptionDto>> GetOptionsAsync(StudioCRM.Application.DTOs.TrainerPortal.PortalPageFilter filter, bool? isActive = true)
+    {
+        filter.Validate();
+        var query = VisiblePackages();
+        if (filter.LocationId.HasValue) query = query.Where(p => p.LocationId == null || p.LocationId == filter.LocationId);
+        if (isActive.HasValue) query = query.Where(p => p.IsActive == isActive);
+        if (!string.IsNullOrWhiteSpace(filter.Search))
+        {
+            var term = filter.Search.Trim().ToLower();
+            query = query.Where(p => p.Name.ToLower().Contains(term));
+        }
+        var total = await query.CountAsync();
+        var items = await OrderForPicker(query).Skip((filter.Page - 1) * filter.PageSize).Take(filter.PageSize)
+            .Select(p => new PackageOptionDto { BillingMode = p.BillingMode, Id = p.Id, Name = p.Name, LocationId = p.LocationId,
+                Price = p.Price, Currency = p.Currency, PackageType = p.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? "PeriodBased" : StudioCRM.Application.Common.PackageTypeMapper.FromBillingType(p.BillingType),
+                BillingType = p.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? "" : p.BillingType.ToString(), ParticipantsCount = p.ParticipantsCount, SessionsLimit = p.SessionsLimit, IsActive = p.IsActive, IsSupporting = p.Name.ToLower().Contains(SupportingNameMarker), IsHybrid = p.Name.ToLower().Contains(HybridNameMarker) }).ToListAsync();
+        return new() { Items = items, TotalCount = total, Page = filter.Page, PageSize = filter.PageSize, TotalPages = (int)Math.Ceiling(total / (double)filter.PageSize) };
+    }
+
+    public async Task<PackageDto> CreateAsync(CreatePackageDto request)
+    {
+        if (request.IsPubliclyAvailable && _context.OrganizationId != StudioCRMDbContext.LegacyOrganizationId)
+            throw new InvalidOperationException("Public offers are not enabled for this organization yet.");
+        ValidatePeriodMode(request.BillingMode, request.Price, request.DurationDays, request.IsPubliclyAvailable);
+        if (request.LocationId.HasValue)
+        {
+            var locationExists = await _context.Locations.AnyAsync(l => l.Id == request.LocationId.Value);
+            if (!locationExists)
+                throw new InvalidOperationException("Location does not exist.");
+        }
+
+        var package = new Package
+        {
+            BillingMode = request.BillingMode,
+            Name = request.Name,
+            Description = request.Description,
+            Price = request.Price,
+            Currency = request.Currency,
+            SessionsLimit = request.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? 0 : request.SessionsLimit,
+            SessionsPerWeek = request.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? 0 : request.SessionsPerWeek,
+            DurationDays = request.DurationDays,
+            BillingType = request.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? StudioCRM.Domain.Enums.SessionBillingType.OneToOne : request.BillingType,
+            ParticipantsCount = request.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? 0 : ResolveParticipantsCount(request.ParticipantsCount, request.BillingType),
+            LocationId = request.LocationId,
+            IsPubliclyAvailable = request.IsPubliclyAvailable,
+            PublicSlug = NormalizePublicSlug(request.PublicSlug),
+            IsActive = request.IsActive,
+            CreatedAt = DateTime.UtcNow,
+            UpdatedAt = DateTime.UtcNow,
+            CreatedBy = request.CreatedBy
+        };
+
+        await _context.Packages.AddAsync(package);
+        await _context.SaveChangesAsync();
+
+        return MapToDto(package);
+    }
+
+    public async Task<List<PackageDto>> GetAllAsync(int? locationId = null, bool? isActive = null)
+    {
+        var query = VisiblePackages()
+            .Include(p => p.Location)
+            .AsQueryable();
+
+        if (locationId.HasValue)
+        {
+            query = query.Where(p => p.LocationId == locationId.Value);
+        }
+
+        if (isActive.HasValue) query = query.Where(p => p.IsActive == isActive);
+        return await OrderForPicker(query)
+            .Select(p => MapToDto(p))
+            .ToListAsync();
+    }
+
+    public async Task<PackageDto?> GetByIdAsync(int id)
+    {
+        return await VisiblePackages()
+            .Include(p => p.Location)
+            .Where(p => p.Id == id)
+            .Select(p => MapToDto(p))
+            .FirstOrDefaultAsync();
+    }
+
+    public async Task<PackageDto?> UpdateAsync(int id, UpdatePackageDto request)
+    {
+        var package = await _context.Packages.FirstOrDefaultAsync(p => p.Id == id);
+        if (package is null)
+        {
+            return null;
+        }
+
+        if (request.LocationId.HasValue)
+        {
+            var locationExists = await _context.Locations.AnyAsync(l => l.Id == request.LocationId.Value);
+            if (!locationExists)
+                throw new InvalidOperationException("Location does not exist.");
+        }
+
+        if (request.IsPubliclyAvailable && _context.OrganizationId != StudioCRMDbContext.LegacyOrganizationId)
+            throw new InvalidOperationException("Public offers are not enabled for this organization yet.");
+        ValidatePeriodMode(request.BillingMode ?? package.BillingMode, request.Price, request.DurationDays, request.IsPubliclyAvailable);
+        if (request.BillingMode.HasValue && request.BillingMode != package.BillingMode)
+            throw new InvalidOperationException("Package billing mode cannot be changed. Create a separate offer.");
+        package.Name = request.Name;
+        package.Description = request.Description;
+        package.Price = request.Price;
+        package.Currency = request.Currency;
+        package.SessionsLimit = package.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? 0 : request.SessionsLimit;
+        package.SessionsPerWeek = package.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? 0 : request.SessionsPerWeek;
+        package.DurationDays = request.DurationDays;
+        package.BillingType = package.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? StudioCRM.Domain.Enums.SessionBillingType.OneToOne : request.BillingType;
+        package.ParticipantsCount = package.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased ? 0 : ResolveParticipantsCount(request.ParticipantsCount, request.BillingType);
+        package.LocationId = request.LocationId;
+        package.IsPubliclyAvailable = request.IsPubliclyAvailable;
+        package.PublicSlug = NormalizePublicSlug(request.PublicSlug);
+        package.IsActive = request.IsActive;
+        package.UpdatedAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync();
+
+        return MapToDto(package);
+    }
+
+    public async Task<bool> DeleteAsync(int id)
+    {
+        var package = await _context.Packages
+            .IncludingOrganizationArchive(_context.OrganizationId)
+            .FirstOrDefaultAsync(p => p.Id == id);
+
+        if (package is null)
+        {
+            return false;
+        }
+
+        if (package.IsDeleted)
+        {
+            return true;
+        }
+
+        var isUsedByActiveSubscription = await _context.ClientPackages
+            .AnyAsync(cp => cp.PackageId == id && cp.IsActive);
+
+        var isScheduledAsNextPackage = await _context.Clients
+            .IncludingOrganizationArchive(_context.OrganizationId)
+            .AnyAsync(c => c.ActivePackageId == id || c.NextPackageId == id);
+
+        if (isUsedByActiveSubscription || isScheduledAsNextPackage)
+        {
+            throw new InvalidOperationException(
+                "Package cannot be deleted while it is used by an active or scheduled subscription. Deactivate it or change clients to another package first.");
+        }
+
+        package.IsDeleted = true;
+        package.IsActive = false;
+        package.DeletedAt = DateTime.UtcNow;
+        package.UpdatedAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync();
+        return true;
+    }
+    public async Task<bool> RestoreAsync(int id)
+    {
+        var package = await _context.Packages
+            .IncludingOrganizationArchive(_context.OrganizationId)
+            .FirstOrDefaultAsync(p => p.Id == id);
+
+        if (package is null || !package.IsDeleted)
+        {
+            return false;
+        }
+
+        package.IsDeleted = false;
+        package.DeletedAt = null;
+        package.UpdatedAt = DateTime.UtcNow;
+
+        await _context.SaveChangesAsync();
+        return true;
+    }
+
+    public async Task<List<PackageDto>> GetDeletedAsync()
+    {
+        return await _context.Packages
+            .IncludingOrganizationArchive(_context.OrganizationId)
+            .Include(p => p.Location)
+            .Where(p => p.IsDeleted)
+            .Select(p => MapToDto(p))
+            .ToListAsync();
+    }
+
+    public async Task<List<ClientDto>?> GetClientsAsync(int id)
+    {
+        var packageExists = await VisiblePackages().AnyAsync(p => p.Id == id);
+        if (!packageExists)
+        {
+            return null;
+        }
+
+        var query = _context.Clients
+            .Include(c => c.Trainer)
+                .ThenInclude(t => t!.User)
+            .Include(c => c.Location)
+            .Where(c => c.ActivePackageId == id || _context.ClientPackages.Any(p => p.ClientId == c.Id && p.PackageId == id && p.BillingMode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased && p.IsActive && p.ClosureDisposition == null));
+
+        if (_currentUser.IsTrainer && !_currentUser.IsOwner)
+        {
+            if (!_currentUser.UserId.HasValue)
+            {
+                return new List<ClientDto>();
+            }
+
+            var trainerId = await _context.Trainers
+                .Where(t => t.UserId == _currentUser.UserId.Value)
+                .Select(t => (int?)t.Id)
+                .FirstOrDefaultAsync();
+
+            if (!trainerId.HasValue)
+            {
+                return new List<ClientDto>();
+            }
+
+            query = query.Where(c => c.TrainerId == trainerId.Value);
+        }
+
+        return await query
+            .OrderByDescending(c => c.CreatedAt)
+            .Select(c => new ClientDto
+            {
+                Id = c.Id,
+                TrainerId = c.TrainerId,
+                ActivePackageId = c.ActivePackageId,
+                LocationId = c.LocationId,
+                LocationName = c.Location.Name,
+                FirstName = c.FirstName,
+                LastName = c.LastName,
+                FullName = c.FirstName + " " + c.LastName,
+                Email = c.Email,
+                EmailContactUrl = "mailto:" + c.Email,
+                PhoneNumber = c.PhoneNumber,
+                PhoneContactUrl = c.PhoneNumber != null ? "tel:" + c.PhoneNumber : null,
+                AvatarUrl = c.User != null ? c.User.AvatarUrl : null,
+                Goal = c.Goal,
+                Notes = c.Notes,
+                BillingStatus = c.BillingStatus,
+                Source = c.Source,
+                PortalAccessMode = c.TrainerId.HasValue ? "FullCrm" : "GroupOnly",
+                Status = c.Status,
+                NextSessionAt = c.NextSessionAt,
+                TrainingStartDate = c.TrainingStartDate,
+                CreatedAt = c.CreatedAt,
+                UpdatedAt = c.UpdatedAt,
+                CreatedBy = c.CreatedBy,
+                TrainerFullName = c.Trainer != null
+                    ? c.Trainer.User.FirstName + " " + c.Trainer.User.LastName
+                    : null
+            })
+            .ToListAsync();
+    }
+
+    private const string SupportingNameMarker = "wspieraj";
+    private const string HybridNameMarker = "hybryd";
+    private const string StandardNamePrefix = "pakiet";
+
+    // Lista do wyboru: najpierw pakiety na wejścia wg typu (1:1, 2:1, 3:1, 4:1, grupowe),
+    // potem pozostałe okresowe, następnie wszystkie hybrydowe razem, osobna sekcja „Wspierający”,
+    // a na samym dole pakiety o niestandardowych nazwach (nie zaczynają się od „Pakiet”);
+    // w obrębie typu rosnąco wg liczby wejść (4, 8, 12, …), potem lokalizacji (wspólne na końcu), nazwy i ceny.
+    internal static IQueryable<Package> OrderForPicker(IQueryable<Package> query)
+        => query
+            .OrderBy(p => !p.Name.ToLower().StartsWith(StandardNamePrefix)
+                && !p.Name.ToLower().Contains(HybridNameMarker)
+                && !p.Name.ToLower().Contains(SupportingNameMarker))
+            .ThenBy(p => p.Name.ToLower().Contains(SupportingNameMarker))
+            .ThenBy(p => p.Name.ToLower().Contains(HybridNameMarker))
+            .ThenBy(p => p.BillingMode)
+            .ThenBy(p => p.BillingType)
+            .ThenBy(p => p.SessionsLimit)
+            .ThenBy(p => p.LocationId == null)
+            .ThenBy(p => p.Location != null ? p.Location.Name : null)
+            .ThenBy(p => p.Name)
+            .ThenBy(p => p.Price)
+            .ThenBy(p => p.Id);
+
+    private IQueryable<Package> VisiblePackages()
+    {
+        var query = _context.Packages.AsNoTracking();
+        if (_currentUser.IsOwner) return query;
+        if (!_currentUser.IsTrainer || !_currentUser.UserId.HasValue) return query.Where(p => false);
+        return query.Where(p => p.LocationId == null || _context.TrainerLocations.Any(t =>
+            t.Trainer.UserId == _currentUser.UserId.Value && t.LocationId == p.LocationId));
+    }
+
+    private static PackageDto MapToDto(Package package)
+    {
+        return new PackageDto
+        {
+            Id = package.Id,
+            BillingMode = package.BillingMode,
+            Name = package.Name,
+            Description = package.Description,
+            Price = package.Price,
+            Currency = package.Currency,
+            SessionsLimit = package.SessionsLimit,
+            SessionsPerWeek = package.SessionsPerWeek,
+            DurationDays = package.DurationDays,
+            BillingType = package.BillingType,
+            ParticipantsCount = package.ParticipantsCount,
+            LocationId = package.LocationId,
+            LocationName = package.Location?.Name,
+            IsPubliclyAvailable = package.IsPubliclyAvailable,
+            PublicSlug = package.PublicSlug,
+            IsActive = package.IsActive,
+            IsSupporting = package.Name.ToLower().Contains(SupportingNameMarker),
+            IsHybrid = package.Name.ToLower().Contains(HybridNameMarker),
+            CreatedAt = package.CreatedAt,
+            UpdatedAt = package.UpdatedAt,
+            CreatedBy = package.CreatedBy
+        };
+    }
+
+    private static int ResolveParticipantsCount(int? participantsCount, StudioCRM.Domain.Enums.SessionBillingType billingType)
+    {
+        var resolved = participantsCount ?? (int)billingType;
+
+        if (billingType == StudioCRM.Domain.Enums.SessionBillingType.Group)
+        {
+            if (resolved < 1 || resolved > 100)
+                throw new InvalidOperationException("Group package participants count must be between 1 and 100.");
+
+            return resolved;
+        }
+
+        if (resolved < 1 || resolved > 4)
+        {
+            throw new InvalidOperationException("Participants count must be between 1 and 4.");
+        }
+
+        return resolved;
+    }
+
+    private static void ValidatePeriodMode(StudioCRM.Domain.Enums.PackageBillingMode mode, decimal price, int days, bool publicOffer)
+    {
+        if (!Enum.IsDefined(mode)) throw new InvalidOperationException("Unknown billing mode.");
+        if (mode == StudioCRM.Domain.Enums.PackageBillingMode.PeriodBased && (price < 0 || days < 1 || days > 3660 || publicOffer))
+            throw new InvalidOperationException("Period packages require a nonnegative price, 1..3660 days and Owner assignment.");
+    }
+
+    private static string? NormalizePublicSlug(string? value)
+    {
+        var normalized = value?.Trim().ToLowerInvariant();
+        return string.IsNullOrWhiteSpace(normalized) ? null : normalized;
+    }
+}
